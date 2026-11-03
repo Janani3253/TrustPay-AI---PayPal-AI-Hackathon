@@ -55,6 +55,15 @@ def initialize_database() -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS approvals (
+                id TEXT PRIMARY KEY,
+                order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                approved_version INTEGER NOT NULL,
+                approved_snapshot_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                approved_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS transactions (
                 id TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
