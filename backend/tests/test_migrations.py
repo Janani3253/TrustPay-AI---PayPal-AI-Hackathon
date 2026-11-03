@@ -1,0 +1,58 @@
+from pathlib import Path
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+from app.db.base import Base
+import app.models  # ensure models are registered with Base.metadata
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+ALEMBIC_INI = BACKEND_DIR / "alembic.ini"
+
+
+def test_alembic_config_loads():
+    """Verify alembic.ini exists and can be parsed with latest migration head."""
+    assert ALEMBIC_INI.exists()
+    config = Config(str(ALEMBIC_INI))
+    script = ScriptDirectory.from_config(config)
+    heads = script.get_heads()
+    assert len(heads) == 1
+    assert heads[0].startswith("000")
+
+
+def test_alembic_revisions_chain():
+    """Verify migration revision lineage."""
+    config = Config(str(ALEMBIC_INI))
+    script = ScriptDirectory.from_config(config)
+
+    rev1 = script.get_revision("0001_initial_baseline")
+    assert rev1 is not None
+    assert rev1.down_revision is None
+
+    rev2 = script.get_revision("0002_create_users_and_auth_sessions")
+    assert rev2 is not None
+    assert rev2.down_revision == "0001_initial_baseline"
+    assert "Create users and auth_sessions tables" in rev2.doc
+
+    rev3 = script.get_revision("0003_create_carts_and_cart_items")
+    assert rev3 is not None
+    assert rev3.down_revision == "0002_create_users_and_auth_sessions"
+
+    rev4 = script.get_revision("0004_create_orders_and_approvals")
+    assert rev4 is not None
+    assert rev4.down_revision == "0003_create_carts_and_cart_items"
+
+    rev5 = script.get_revision("0005_create_transactions_and_audit")
+    assert rev5 is not None
+    assert rev5.down_revision == "0004_create_orders_and_approvals"
+
+
+def test_base_metadata_is_ready_for_migrations():
+    """Verify Base.metadata contains required domain tables."""
+    assert hasattr(Base, "metadata")
+    assert "users" in Base.metadata.tables
+    assert "auth_sessions" in Base.metadata.tables
+    assert "carts" in Base.metadata.tables
+    assert "cart_items" in Base.metadata.tables
+    assert "orders" in Base.metadata.tables
+    assert "approvals" in Base.metadata.tables
+    assert "transactions" in Base.metadata.tables
+    assert "audit_events" in Base.metadata.tables

@@ -20,6 +20,28 @@ from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
+from app.core.config import settings
+from app.core.database import check_db_connectivity, close_db_engine
+from app.core.dependencies import get_current_user, get_optional_current_user
+from app.routers import (
+    auth_router,
+    users_router,
+    products_router,
+    platforms_router,
+    intent_router,
+    security_router,
+    cart_router,
+    verification_router,
+    orders_router,
+    approvals_router,
+    payments_router,
+    transactions_router,
+    dashboard_router,
+    audit_router,
+)
+from app.services.product_service import product_service
+from app.services.intent_service import intent_service
+from app.core.audit import add_audit
 from .database import connect, initialize_database
 from .schemas import (
     ApprovalRequest,
@@ -60,10 +82,32 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
+app.include_router(auth_router)
+app.include_router(users_router)
+app.include_router(products_router)
+app.include_router(platforms_router)
+app.include_router(intent_router)
+app.include_router(security_router)
+app.include_router(cart_router)
+app.include_router(verification_router)
+app.include_router(orders_router)
+app.include_router(approvals_router)
+app.include_router(payments_router)
+app.include_router(transactions_router)
+app.include_router(dashboard_router)
+app.include_router(audit_router)
+
 
 @app.on_event("startup")
 def startup() -> None:
     initialize_database()
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await close_db_engine()
+    await product_service.close()
+    await intent_service.close()
 
 
 def utc_now() -> str:
@@ -124,39 +168,8 @@ def decode_token(token: str) -> int:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired access token.") from error
 
 
-def get_current_user(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bearer access token is required.")
-    user_id = decode_token(authorization.removeprefix("Bearer ").strip())
-    with connect() as connection:
-        user = connection.execute(
-            "SELECT id, name, email FROM users WHERE id = ?",
-            (user_id,),
-        ).fetchone()
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User account no longer exists.")
-    return dict(user)
-
-
-def add_audit(user_id: int, event_type: str, description: str) -> None:
-    event_id = str(uuid.uuid4())
-    timestamp = utc_now()
-    with connect() as connection:
-        previous = connection.execute(
-            "SELECT hash FROM audit_events WHERE user_id = ? ORDER BY rowid DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        previous_hash = previous["hash"] if previous else "GENESIS"
-        payload = {"id": event_id, "type": event_type, "timestamp": timestamp, "description": description}
-        digest = hashlib.sha256(f"{previous_hash}:{json_dump(payload)}".encode()).hexdigest()
-        connection.execute(
-            """INSERT INTO audit_events
-               (id, user_id, type, timestamp, description, previous_hash, hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (event_id, user_id, event_type, timestamp, description, previous_hash, digest),
-        )
-
-
+# get_current_user provided by app.core.dependencies
+# add_audit is imported from app.core.audit
 async def dummyjson_get(path: str, params: dict[str, Any] | None = None) -> Any:
     try:
         async with httpx.AsyncClient(timeout=12) as client:
@@ -171,10 +184,14 @@ async def dummyjson_get(path: str, params: dict[str, Any] | None = None) -> Any:
 
 
 async def fetch_product(product_id: int) -> dict[str, Any]:
-    product = await dummyjson_get(f"/products/{product_id}")
-    if not isinstance(product, dict) or product.get("id") != product_id:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Product catalogue returned an invalid product.")
-    return product
+    try:
+        product = await product_service.get_product_details(product_id)
+        return product.model_dump(by_alias=True)
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Product catalogue returned an invalid product.",
+        ) from error
 
 
 async def current_cart(user_id: int) -> list[dict[str, Any]]:
@@ -228,7 +245,7 @@ def parse_intent(payload: IntentRequest) -> dict[str, Any]:
             inferred_category = category
             break
     budget_match = re.search(
-        r"(?:under|below|less than|maximum|max|budget(?: of)?|up to)\s*(?:₹|\$)?\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?",
+        r"(?:under|below|less than|maximum|max|budget(?: of)?|up to)\s*(?:Γé╣|\$)?\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?",
         text,
         re.IGNORECASE,
     )
@@ -239,7 +256,7 @@ def parse_intent(payload: IntentRequest) -> dict[str, Any]:
     currency = payload.currency
     if re.search(r"\$|usd|dollars?", text, re.IGNORECASE):
         currency = "USD"
-    elif re.search(r"₹|inr|rupees?", text, re.IGNORECASE):
+    elif re.search(r"Γé╣|inr|rupees?", text, re.IGNORECASE):
         currency = "INR"
     return {
         "request": text,
@@ -368,107 +385,71 @@ async def paypal_access_token() -> str:
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "application": settings.APP_NAME,
+        "environment": settings.APP_ENV,
+    }
 
 
-@app.post("/api/auth/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterRequest) -> dict[str, Any]:
-    with connect() as connection:
-        try:
-            cursor = connection.execute(
-                "INSERT INTO users (name, email, password_hash, created_at) VALUES (?, ?, ?, ?)",
-                (payload.name.strip(), payload.email.lower(), make_password_hash(payload.password), utc_now()),
-            )
-        except sqlite3.IntegrityError as error:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An account with this email already exists.") from error
-        user = {"id": cursor.lastrowid, "name": payload.name.strip(), "email": payload.email.lower()}
-    add_audit(int(user["id"]), "Account registered", "Created a customer account.")
-    return {"access_token": create_token(int(user["id"])), "user": user}
+@app.get("/api/health")
+async def api_health() -> dict[str, Any]:
+    db_status = await check_db_connectivity()
+    if db_status.get("status") == "connected":
+        return {
+            "status": "ok",
+            "application": settings.APP_NAME,
+            "services": {
+                "postgresql": {
+                    "status": "connected",
+                    "engine": "PostgreSQL",
+                    "version": db_status.get("version", "16"),
+                }
+            },
+        }
+    elif db_status.get("status") == "not_configured":
+        return {
+            "status": "degraded",
+            "application": settings.APP_NAME,
+            "services": {
+                "postgresql": {
+                    "status": "not_configured",
+                }
+            },
+        }
+    else:
+        return {
+            "status": "degraded",
+            "application": settings.APP_NAME,
+            "services": {
+                "postgresql": {
+                    "status": "unavailable",
+                }
+            },
+        }
 
 
-@app.post("/api/auth/login", response_model=AuthResponse)
-def login(payload: LoginRequest) -> dict[str, Any]:
-    with connect() as connection:
-        user = connection.execute(
-            "SELECT id, name, email, password_hash FROM users WHERE email = ?",
-            (payload.email.lower(),),
-        ).fetchone()
-    if user is None or not verify_password(payload.password, user["password_hash"]):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Email or password is incorrect.")
-    public_user = {"id": user["id"], "name": user["name"], "email": user["email"]}
-    add_audit(int(user["id"]), "User signed in", "Authenticated a customer session.")
-    return {"access_token": create_token(user["id"]), "user": public_user}
+# /api/intent/parse moved to app.routers.intent_router
 
 
-@app.get("/api/auth/me", response_model=UserResponse)
-def get_me(user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
-    return user
-
-
-@app.get("/api/platforms")
-def platforms(user: dict[str, Any] = Depends(get_current_user)) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": "dummyjson",
-            "name": "DummyJSON Demo Store",
-            "supported": True,
-            "demo_only": True,
-            "description": "Catalogue browsing and product details are provided by DummyJSON.",
-        },
-        *[
-            {
-                "id": platform,
-                "name": platform,
-                "supported": False,
-                "demo_only": False,
-                "description": "Direct shopping integration is not configured for this platform.",
-            }
-            for platform in ("Amazon", "Flipkart", "Myntra")
-        ],
-    ]
-
-
-@app.post("/api/intent/parse")
-def intent_parse(payload: IntentRequest, user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
-    if payload.platformId != "dummyjson":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only the DummyJSON Demo Store is supported.")
-    intent = parse_intent(payload)
-    add_audit(user["id"], "Purchase policy created", "Created a purchase policy through the backend intent parser.")
-    return intent
-
-
-@app.get("/api/products")
-async def list_products(
-    q: str | None = None,
-    category: str | None = None,
-    limit: int = 200,
+@app.get("/api/recommendations/search")
+async def recommendations_get(
+    request: str = "",
+    category: str = "",
+    maximumBudget: float = 1000.0,
+    currency: str = "USD",
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
-    if not 1 <= limit <= 200:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="limit must be between 1 and 200.")
-    if q and q.strip():
-        return await dummyjson_get("/products/search", {"q": q.strip(), "limit": limit})
-    if category:
-        if not re.fullmatch(r"[a-z0-9-]{1,80}", category):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid product category.")
-        return await dummyjson_get(f"/products/category/{quote(category, safe='')}", {"limit": limit})
-    return await dummyjson_get("/products", {"limit": limit})
-
-
-@app.get("/api/products/categories")
-async def list_categories(user: dict[str, Any] = Depends(get_current_user)) -> list[dict[str, Any]]:
-    result = await dummyjson_get("/products/categories")
-    return [
-        {"slug": item, "name": item.replace("-", " ").title(), "url": ""}
-        if isinstance(item, str)
-        else item
-        for item in result
-    ]
-
-
-@app.get("/api/products/{product_id}")
-async def product_details(product_id: int, user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
-    return await fetch_product(product_id)
+    payload = {
+        "intent": {
+            "request": request,
+            "category": category,
+            "maximumBudget": maximumBudget,
+            "currency": currency,
+            "requirements": [],
+        }
+    }
+    return await recommendations(payload=payload, user=user)
 
 
 @app.post("/api/recommendations/search")
@@ -481,15 +462,28 @@ async def recommendations(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="An intent object is required.")
     category = intent.get("category")
     query = intent.get("request", "").strip()
-    if category:
-        if not isinstance(category, str) or not re.fullmatch(r"[a-z0-9-]{1,80}", category):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid product category.")
-        result = await dummyjson_get(f"/products/category/{quote(category, safe='')}", {"limit": 200})
-    else:
-        result = await dummyjson_get("/products/search", {"q": " ".join(query.split()[:3]), "limit": 200})
+    try:
+        if category:
+            if not isinstance(category, str) or not re.fullmatch(r"[a-z0-9-]{1,80}", category):
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid product category.")
+            result = await product_service.list_products(category=category, limit=200)
+        else:
+            search_query = " ".join(query.split()[:3]).strip()
+            if search_query:
+                result = await product_service.search_products(query=search_query, limit=200)
+            else:
+                result = await product_service.list_products(limit=200)
+    except HTTPException:
+        raise
+    except Exception as err:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="The product catalogue service is currently unavailable.",
+        ) from err
     enriched = []
     budget = float(intent.get("maximumBudget", 0))
-    for product in result.get("products", []):
+    for norm_prod in result.products:
+        product = norm_prod.model_dump(by_alias=True)
         matched_category = not category or product.get("category") == category
         currency_matches = intent.get("currency") == "USD"
         total = float(product.get("price", 0)) * 1.05 + FEE_SHIPPING
@@ -528,13 +522,14 @@ async def recommendations(
     return {"recommendations": enriched, "total": len(enriched)}
 
 
-@app.get("/api/cart")
+# Legacy cart routes moved to cart_router
+@app.get("/api/legacy-cart")
 async def get_cart(user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
     items = await current_cart(user["id"])
     return {"items": items, "totals": cart_price(items)}
 
 
-@app.post("/api/cart/items")
+@app.post("/api/legacy-cart/items")
 async def add_cart_item(
     payload: CartItemRequest,
     user: dict[str, Any] = Depends(get_current_user),
@@ -550,7 +545,7 @@ async def add_cart_item(
     return await get_cart(user)
 
 
-@app.put("/api/cart/items/{product_id}")
+@app.put("/api/legacy-cart/items/{product_id}")
 async def update_cart_item(
     product_id: int,
     payload: CartQuantityRequest,
@@ -567,7 +562,7 @@ async def update_cart_item(
     return await get_cart(user)
 
 
-@app.delete("/api/cart/items/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete("/api/legacy-cart/items/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_cart_item(product_id: int, user: dict[str, Any] = Depends(get_current_user)) -> None:
     with connect() as connection:
         connection.execute(
@@ -577,14 +572,14 @@ def delete_cart_item(product_id: int, user: dict[str, Any] = Depends(get_current
     add_audit(user["id"], "Cart changed", f"Removed product {product_id} from the cart.")
 
 
-@app.delete("/api/cart/items", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete("/api/legacy-cart/items", status_code=status.HTTP_204_NO_CONTENT)
 def clear_cart(user: dict[str, Any] = Depends(get_current_user)) -> None:
     with connect() as connection:
         connection.execute("DELETE FROM cart_items WHERE user_id = ?", (user["id"],))
     add_audit(user["id"], "Cart cleared", "Cleared cart after a completed purchase.")
 
 
-@app.post("/api/orders", status_code=status.HTTP_201_CREATED)
+@app.post("/api/legacy-orders", status_code=status.HTTP_201_CREATED)
 async def create_order(
     payload: OrderRequest,
     user: dict[str, Any] = Depends(get_current_user),
@@ -617,7 +612,8 @@ async def create_order(
     }
 
 
-@app.post("/api/verification/order")
+# /api/verification/order moved to verification_router
+@app.post("/api/legacy-verification/order")
 async def verify_order(
     payload: VerifyOrderRequest,
     user: dict[str, Any] = Depends(get_current_user),
@@ -648,7 +644,7 @@ async def verify_order(
     return {"order_id": payload.order_id, **checks}
 
 
-@app.post("/api/approvals/{order_id}/approve")
+@app.post("/api/legacy-approvals/{order_id}/approve")
 async def approve_order(
     order_id: str,
     payload: ApprovalRequest,
@@ -669,7 +665,7 @@ async def approve_order(
     return {"order_id": order_id, "order_version": payload.order_version, "status": "approved"}
 
 
-@app.post("/api/payments/create-order")
+@app.post("/api/legacy-payments/create-order")
 async def create_payment_order(
     payload: VerifyOrderRequest,
     user: dict[str, Any] = Depends(get_current_user),
@@ -720,7 +716,7 @@ async def create_payment_order(
     return {"order_id": order["id"], "paypal_order_id": paypal_order["id"], "approval_url": approval_url, "status": "PENDING"}
 
 
-@app.post("/api/payments/capture-order")
+@app.post("/api/legacy-payments/capture-order")
 async def capture_payment(
     payload: PayPalCaptureRequest,
     user: dict[str, Any] = Depends(get_current_user),
