@@ -45,6 +45,39 @@ export interface Product {
   source: 'DummyJSON'
 }
 
+export type MarketplaceProviderName = 'AMAZON' | 'FLIPKART' | 'MYNTRA' | 'DEMO'
+
+export type MarketplaceProviderStatus =
+  | 'CONNECTED'
+  | 'NOT_CONFIGURED'
+  | 'TEMPORARILY_UNAVAILABLE'
+  | 'AUTHENTICATION_FAILED'
+
+export interface MarketplaceProvider {
+  name: MarketplaceProviderName
+  connected: boolean
+  status: MarketplaceProviderStatus
+  message?: string
+}
+
+export interface MarketplaceProduct {
+  id: string
+  external_product_id: string
+  provider: MarketplaceProviderName
+  title: string
+  description?: string | null
+  image_url?: string | null
+  price?: number | null
+  currency: string | null
+  category?: string | null
+  rating?: number | null
+  product_url?: string | null
+  seller_name?: string | null
+  seller_verified?: boolean | null
+  specifications?: Record<string, unknown> | null
+  source_updated_at?: string | null
+}
+
 export interface CartItem {
   product: Product
   quantity: number
