@@ -56,7 +56,7 @@ async def analyze_product(
     try:
         product = await product_service.get_product_details(
             product_id=payload.product_id,
-            platform=payload.provider,
+            platform_id=payload.provider,
         )
     except ProductNotFoundError as err:
         raise HTTPException(

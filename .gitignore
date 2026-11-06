@@ -1,0 +1,41 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env
+
+# Local database cluster and storage
+pgdata/
+*.db
+*.sqlite
+*.sqlite3
+
+# Python virtual environment and caches
+.venv/
+backend/.venv/
+__pycache__/
+backend/app/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Node.js frontend
+node_modules/
+dist/
+build/
+.npm/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+*.tmp

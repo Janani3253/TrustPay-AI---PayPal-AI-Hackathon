@@ -19,6 +19,7 @@ if str(BACKEND_DIR) not in sys.path:
 # Use an isolated temp database path for tests to avoid touching trustpay.db
 TEMP_TEST_DB = Path(tempfile.gettempdir()) / "trustpay_test_isolated.db"
 os.environ["TRUSTPAY_DATABASE_PATH"] = str(TEMP_TEST_DB)
+os.environ["DATABASE_URL"] = ""
 
 from app.database import initialize_database
 from app.main import app

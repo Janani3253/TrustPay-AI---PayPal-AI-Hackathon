@@ -50,11 +50,12 @@ def test_alembic_revisions_chain():
 def test_base_metadata_is_ready_for_migrations():
     """Verify Base.metadata contains required domain tables."""
     assert hasattr(Base, "metadata")
-    assert "users" in Base.metadata.tables
-    assert "auth_sessions" in Base.metadata.tables
-    assert "carts" in Base.metadata.tables
-    assert "cart_items" in Base.metadata.tables
-    assert "orders" in Base.metadata.tables
-    assert "approvals" in Base.metadata.tables
-    assert "transactions" in Base.metadata.tables
-    assert "audit_events" in Base.metadata.tables
+    table_names = {t.name for t in Base.metadata.tables.values()}
+    assert "users" in table_names
+    assert "auth_sessions" in table_names
+    assert "carts" in table_names
+    assert "cart_items" in table_names
+    assert "orders" in table_names
+    assert "approvals" in table_names
+    assert "transactions" in table_names
+    assert "audit_events" in table_names

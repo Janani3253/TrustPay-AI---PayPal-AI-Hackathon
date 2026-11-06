@@ -43,6 +43,8 @@ def run_migrations_offline() -> None:
     context.configure(
         url=url,
         target_metadata=target_metadata,
+        version_table_schema="trustpay_ai",
+        version_table="alembic_version",
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
@@ -54,9 +56,26 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
+    import sqlalchemy as sa
+
+    # Ensure trustpay_ai schema exists before Alembic checks or creates version table
+    connection.execute(sa.text("CREATE SCHEMA IF NOT EXISTS trustpay_ai"))
+    # Set search_path so unqualified migration operations resolve strictly inside trustpay_ai
+    connection.execute(sa.text("SET search_path TO trustpay_ai"))
+
+    def include_object(object, name, type_, reflected, compare_to):
+        if type_ == "table":
+            # Only track and inspect tables that belong to the trustpay_ai schema
+            return getattr(object, "schema", None) == "trustpay_ai"
+        return True
+
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
+        version_table_schema="trustpay_ai",
+        version_table="alembic_version",
+        include_schemas=False,
+        include_object=include_object,
         compare_type=True,
         compare_server_default=True,
     )

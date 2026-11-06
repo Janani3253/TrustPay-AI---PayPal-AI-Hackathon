@@ -15,7 +15,11 @@ from app.models.user import User
 @pytest_asyncio.fixture
 async def test_app_client():
     """Create a test client backed by an isolated in-memory SQLite database."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        echo=False,
+        execution_options={"schema_translate_map": {"trustpay_ai": None}},
+    )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 

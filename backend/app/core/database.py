@@ -1,3 +1,4 @@
+import os
 from typing import Any, AsyncGenerator, Dict
 from fastapi import HTTPException, status
 from sqlalchemy import text
@@ -15,12 +16,20 @@ _async_session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
 def normalize_database_url(url: str | None) -> str | None:
-    """Ensure the URL uses the async psycopg driver."""
+    """Ensure the URL uses the async psycopg driver and handles Render URLs with SSL."""
     if not url:
         return None
     url = url.strip()
-    if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+psycopg://", 1)
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    # Render PostgreSQL requires SSL (sslmode=require) for external connections
+    if "sslmode=" not in url and ("render.com" in url or os.getenv("RENDER")):
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}sslmode=require"
+
     return url
 
 
@@ -41,6 +50,7 @@ def get_async_engine() -> AsyncEngine | None:
             max_overflow=settings.DB_MAX_OVERFLOW,
             pool_timeout=settings.DB_POOL_TIMEOUT,
             pool_recycle=settings.DB_POOL_RECYCLE,
+            connect_args={"options": "-c search_path=trustpay_ai,public"},
         )
         _async_session_factory = async_sessionmaker(
             bind=_async_engine,
@@ -55,6 +65,8 @@ def get_async_engine() -> AsyncEngine | None:
 def get_session_factory() -> async_sessionmaker[AsyncSession] | None:
     """Retrieve the session factory, initializing engine if needed."""
     global _async_session_factory
+    if not settings.is_postgres_configured:
+        return None
     if _async_session_factory is None:
         get_async_engine()
     return _async_session_factory

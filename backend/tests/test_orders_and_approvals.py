@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.core.config import settings
 from app.core.dependencies import get_current_user
 from app.database import connect, initialize_database
 from app.main import app
@@ -20,7 +21,8 @@ MOCK_USER = {
 
 
 @pytest.fixture(autouse=True)
-def setup_db():
+def setup_db(monkeypatch):
+    monkeypatch.setattr(settings, "DATABASE_URL", None)
     initialize_database()
     with connect() as conn:
         conn.execute("DELETE FROM approvals")

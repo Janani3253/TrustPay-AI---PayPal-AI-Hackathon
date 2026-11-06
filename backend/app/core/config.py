@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     TRUSTPAY_SECRET_KEY: str = "local-development-key-change-before-deployment"
     TRUSTPAY_DATABASE_PATH: str = str(BACKEND_DIR / "trustpay.db")
     TRUSTPAY_CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
+    CORS_ORIGINS: str | None = None
     PAYPAL_CLIENT_ID: str = ""
     PAYPAL_CLIENT_SECRET: str = ""
     PAYPAL_ENVIRONMENT: str = "sandbox"
@@ -98,9 +99,10 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> List[str]:
         """Return parsed list of allowed CORS origins."""
+        raw = self.CORS_ORIGINS or self.TRUSTPAY_CORS_ORIGINS or "http://localhost:5173,http://127.0.0.1:5173"
         return [
             origin.strip()
-            for origin in self.TRUSTPAY_CORS_ORIGINS.split(",")
+            for origin in raw.split(",")
             if origin.strip()
         ]
 
@@ -110,7 +112,7 @@ class Settings(BaseSettings):
         if not self.DATABASE_URL:
             return False
         url_lower = self.DATABASE_URL.lower().strip()
-        if not url_lower.startswith(("postgresql://", "postgresql+psycopg://")):
+        if not url_lower.startswith(("postgresql://", "postgresql+psycopg://", "postgres://")):
             return False
         for marker in PLACEHOLDER_MARKERS:
             if marker in url_lower:

@@ -72,7 +72,11 @@ def test_read_sqlite_users(temp_sqlite_db: Path):
 @pytest.mark.asyncio
 async def test_migration_plan_and_apply(temp_sqlite_db: Path):
     """Verify migration planning and application preserves integer primary-key IDs."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        echo=False,
+        execution_options={"schema_translate_map": {"trustpay_ai": None}},
+    )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 

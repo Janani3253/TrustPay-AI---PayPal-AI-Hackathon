@@ -19,7 +19,7 @@ def test_base_declarative_metadata():
 
 
 def test_normalize_database_url():
-    """Verify URL scheme normalization for async psycopg."""
+    """Verify URL scheme normalization for async psycopg including Render URLs."""
     assert normalize_database_url(None) is None
     assert normalize_database_url("") is None
     assert (
@@ -29,6 +29,16 @@ def test_normalize_database_url():
     assert (
         normalize_database_url("postgresql+psycopg://user:pass@localhost:5432/db")
         == "postgresql+psycopg://user:pass@localhost:5432/db"
+    )
+    # Render postgres:// prefix normalization
+    assert (
+        normalize_database_url("postgres://user:pass@localhost:5432/db")
+        == "postgresql+psycopg://user:pass@localhost:5432/db"
+    )
+    # Render host with automatic SSL requirement injection
+    assert (
+        normalize_database_url("postgres://user:pass@dpg-xxx-a.oregon-postgres.render.com/trustpay")
+        == "postgresql+psycopg://user:pass@dpg-xxx-a.oregon-postgres.render.com/trustpay?sslmode=require"
     )
 
 

@@ -32,9 +32,11 @@ def auth_client():
 
 @pytest.fixture
 def unauth_client():
+    app.dependency_overrides.clear()
     transport = ASGITransport(app=app)
     client = AsyncClient(transport=transport, base_url="http://test")
     yield client
+    app.dependency_overrides.clear()
 
 
 @pytest.fixture(autouse=True)

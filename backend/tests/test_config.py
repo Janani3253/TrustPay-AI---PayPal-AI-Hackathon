@@ -2,9 +2,11 @@ import pytest
 from app.core.config import Settings
 
 
-def test_default_config_loads():
+def test_default_config_loads(monkeypatch):
     """Verify default configuration loads properly."""
-    config = Settings(DATABASE_URL=None)
+    monkeypatch.delenv("DEBUG", raising=False)
+    monkeypatch.delenv("APP_ENV", raising=False)
+    config = Settings(DATABASE_URL=None, DEBUG=True)
     assert config.APP_NAME == "TrustPay AI"
     assert config.APP_ENV == "development"
     assert config.DEBUG is True
@@ -47,6 +49,12 @@ def test_valid_database_url_accepted():
     config = Settings(DATABASE_URL=valid_url)
     assert config.is_postgres_configured is True
     assert config.get_safe_database_url() == "postgresql+psycopg://trustpay_admin:***@localhost:5432/trustpay_production"
+
+    # Render URL starting with postgres://
+    render_url = "postgres://render_user:secret999@dpg-abc-a.oregon-postgres.render.com/trustpay_db"
+    config_render = Settings(DATABASE_URL=render_url)
+    assert config_render.is_postgres_configured is True
+    assert config_render.get_safe_database_url() == "postgres://render_user:***@dpg-abc-a.oregon-postgres.render.com/trustpay_db"
 
 
 def test_safe_database_url_masks_password():

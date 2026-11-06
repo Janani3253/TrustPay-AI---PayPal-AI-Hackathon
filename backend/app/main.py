@@ -12,9 +12,12 @@ import secrets
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
+import logging
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+
+logger = logging.getLogger("trustpay.app")
 
 import httpx
 from dotenv import load_dotenv
@@ -71,20 +74,16 @@ FEE_SHIPPING = 9.99
 FEE_TAX_RATE = 0.05
 
 app = FastAPI(title="TrustPay AI IntentLock API", version="0.1.0")
-allowed_origins = [
-    origin.strip()
-    for origin in os.getenv(
-        "TRUSTPAY_CORS_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
-    ).split(",")
-    if origin.strip()
-]
+allowed_origins = settings.cors_origins
+is_wildcard = "*" in allowed_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
+    allow_origins=["*"] if is_wildcard else allowed_origins,
+    allow_credentials=not is_wildcard,
     allow_methods=["*"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["*"],
+    allow_origin_regex=r"https://.*\.onrender\.com" if not is_wildcard else None,
 )
 
 app.include_router(auth_router)
@@ -106,8 +105,23 @@ app.include_router(intentlock_router)
 
 
 @app.on_event("startup")
-def startup() -> None:
+async def startup() -> None:
     initialize_database()
+    if settings.is_postgres_configured:
+        try:
+            import sqlalchemy as sa
+            from app.db.base import Base, SCHEMA_NAME
+            import app.models  # Register all models with Base.metadata
+            from app.core.database import get_async_engine
+            engine = get_async_engine()
+            if engine:
+                async with engine.begin() as conn:
+                    if SCHEMA_NAME:
+                        await conn.execute(sa.text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME}"))
+                    await conn.run_sync(Base.metadata.create_all)
+                logger.info("PostgreSQL database tables in schema '%s' verified and ready.", SCHEMA_NAME)
+        except Exception as exc:
+            logger.warning("PostgreSQL auto table creation on startup: %s", exc)
 
 
 @app.on_event("shutdown")
