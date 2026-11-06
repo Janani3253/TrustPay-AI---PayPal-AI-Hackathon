@@ -337,9 +337,9 @@ td small { display: block; margin-top: 4px; color: #9ba4b4; font-size: 8px; }
 .request-layout { display: grid; grid-template-columns: 1.45fr 1fr; gap: 16px; align-items: start; }
 .request-form { display: grid; gap: 17px; padding: 21px; }
 .field-label { display: grid; gap: 8px; color: #37435b; font-size: 10px; font-weight: 670; }
-.field-label textarea, .field-label select { width: 100%; padding: 11px 12px; border: 1px solid #e1e5ed; border-radius: 7px; resize: vertical; color: #303d57; font-size: 11px; line-height: 1.6; }
-.field-label textarea { min-height: 120px; }
-.field-label select { height: 39px; }
+.field-label textarea, .field-label select, .field-label input:not([type="checkbox"]) { width: 100%; padding: 11px 12px; border: 1px solid #e1e5ed; border-radius: 7px; color: #303d57; font-size: 11px; line-height: 1.6; }
+.field-label textarea { min-height: 120px; resize: vertical; }
+.field-label select, .field-label input:not([type="checkbox"]) { height: 39px; }
 .request-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }
 .currency-input { display: flex; height: 39px; align-items: center; gap: 8px; padding: 0 10px; border: 1px solid #e1e5ed; border-radius: 7px; color: #7e899d; font-size: 11px; }
 .currency-input input { width: 100%; border: 0; outline: 0; color: #39445b; font-size: 11px; }

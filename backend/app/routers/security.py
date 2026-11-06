@@ -12,6 +12,8 @@ from app.providers.exceptions import (
     UnsupportedProviderError,
 )
 from app.schemas.security import (
+    ContentScanRequest,
+    ContentScanResponse,
     ProductSecurityScanRequest,
     ProductSecurityScanResponse,
 )
@@ -20,11 +22,11 @@ from app.services.prompt_injection_service import prompt_injection_service
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/security", tags=["Security"])
+router = APIRouter(tags=["Security"])
 
 
 @router.post(
-    "/analyze-product",
+    "/security/analyze-product",
     response_model=ProductSecurityScanResponse,
     status_code=status.HTTP_200_OK,
     summary="Scan product content for prompt injection and untrusted content risks",
@@ -33,6 +35,12 @@ router = APIRouter(prefix="/api/security", tags=["Security"])
         "its metadata using deterministic rules and optional Gemini AI analysis, and returns "
         "the security assessment."
     ),
+)
+@router.post(
+    "/api/security/analyze-product",
+    response_model=ProductSecurityScanResponse,
+    status_code=status.HTTP_200_OK,
+    include_in_schema=False,
 )
 async def analyze_product(
     payload: ProductSecurityScanRequest,
@@ -106,3 +114,45 @@ async def analyze_product(
     )
 
     return scan_result
+
+
+@router.post(
+    "/security/scan-content",
+    response_model=ContentScanResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Scan untrusted shopping website content for prompt injection",
+    description="Analyzes untrusted product descriptions, reviews, or seller text for prompt injection attacks and malicious directives.",
+)
+@router.post(
+    "/api/security/scan-content",
+    response_model=ContentScanResponse,
+    status_code=status.HTTP_200_OK,
+    include_in_schema=False,
+)
+async def scan_untrusted_content(
+    payload: ContentScanRequest,
+    user: User = Depends(get_current_user),
+) -> ContentScanResponse:
+    user_id = user["id"] if isinstance(user, dict) else user.id
+    try:
+        scan_result = await prompt_injection_service.scan_content(
+            content=payload.content,
+            product_id=payload.product_id,
+            source=payload.source or "shopping_website",
+        )
+        add_audit(
+            user_id=user_id,
+            event_type="SECURITY_PROMPT_INJECTION_SCAN",
+            description=(
+                f"Scanned untrusted content. Risk: {scan_result.risk_level.value}, "
+                f"Suspicious: {scan_result.is_suspicious}, Action: {scan_result.action.value}, "
+                f"Patterns: {', '.join(scan_result.detected_patterns) or 'none'}."
+            ),
+        )
+        return scan_result
+    except Exception as exc:
+        logger.error("Content security scan failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Security scan failed: {exc}",
+        ) from exc

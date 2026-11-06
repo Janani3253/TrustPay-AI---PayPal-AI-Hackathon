@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import tempfile
@@ -6,6 +7,9 @@ from typing import AsyncGenerator, Generator
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Ensure backend directory is in sys.path
 BACKEND_DIR = Path(__file__).resolve().parents[1]

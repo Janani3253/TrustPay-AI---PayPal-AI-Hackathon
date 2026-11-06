@@ -138,6 +138,8 @@ class AuditService:
 
         return {"valid": True, "records_checked": len(rows)}
 
+    verify_chain_integrity = verify_integrity
+
 
 audit_service = AuditService()
 

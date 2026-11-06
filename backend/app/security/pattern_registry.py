@@ -27,9 +27,9 @@ SECURITY_RULES: List[SecurityRule] = [
         category=AttackCategory.INSTRUCTION_OVERRIDE,
         severity=SeverityLevel.CRITICAL,
         pattern=compile_pattern(
-            r"\b(?:ignore|disregard|forget|override|bypass|cancel)\s+(?:all\s+)?(?:previous|prior|above|system|initial|preceding)\s+(?:instructions|prompts|rules|directives|constraints|commands)\b"
+            r"\b(?:ignore|disregard|forget|override|bypass|cancel)\s+(?:all\s+)?(?:(?:previous|prior|above|system|initial|preceding|customer(?:'s)?)\s+)?(?:instructions|prompts|rules|directives|constraints|commands|requirements)\b"
         ),
-        description="Attempt to override prior system instructions or constraints.",
+        description="Attempt to override prior system instructions or customer requirements.",
         exclusion_patterns=[
             compile_pattern(r"(?:noise|distraction|distractions|background|ambient)\s+(?:cancellation|chatter)?"),
         ],
@@ -39,7 +39,7 @@ SECURITY_RULES: List[SecurityRule] = [
         category=AttackCategory.INSTRUCTION_OVERRIDE,
         severity=SeverityLevel.CRITICAL,
         pattern=compile_pattern(
-            r"\b(?:system\s+(?:prompt\s+)?override|new\s+system\s+instruction|from\s+now\s+on\s+you\s+(?:must|will))\b"
+            r"\b(?:system\s+(?:prompt\s+)?override|new\s+system\s+instruction|from\s+now\s+on\s+you\s+(?:must|will)|override\s+customer\s+requirements)\b"
         ),
         description="Direct instruction injection to redefine system operational mode.",
     ),
@@ -117,6 +117,24 @@ SECURITY_RULES: List[SecurityRule] = [
         ),
         description="Cart injection directive targeting shopping agent state.",
     ),
+    SecurityRule(
+        rule_id="RULE_CART_004",
+        category=AttackCategory.CART_MANIPULATION,
+        severity=SeverityLevel.HIGH,
+        pattern=compile_pattern(
+            r"\b(?:add|insert|inject)\s+(?:an?\s+)?(?:(?:expensive|premium|extra|hidden|unauthorized|additional)\s+)+(?:product|item|products|items)\b"
+        ),
+        description="Directive to insert unauthorized or expensive premium items into cart.",
+    ),
+    SecurityRule(
+        rule_id="RULE_CART_005",
+        category=AttackCategory.CART_MANIPULATION,
+        severity=SeverityLevel.HIGH,
+        pattern=compile_pattern(
+            r"\b(?:change|substitute|replace|swap)\s+(?:the\s+)?(?:selected|chosen|target)\s+(?:product|item)\b"
+        ),
+        description="Directive to replace or substitute the customer's selected product.",
+    ),
 
     # 4. PURCHASE_BYPASS (CRITICAL)
     SecurityRule(
@@ -133,9 +151,9 @@ SECURITY_RULES: List[SecurityRule] = [
         category=AttackCategory.PURCHASE_BYPASS,
         severity=SeverityLevel.CRITICAL,
         pattern=compile_pattern(
-            r"\b(?:auto-?approve\s+(?:this\s+)?(?:purchase|transaction|order|payment)|execute\s+without\s+(?:user\s+)?confirmation)\b"
+            r"\b(?:auto-?approve\s+(?:this\s+)?(?:purchase|transaction|order|payment)|execute\s+without\s+(?:user\s+)?confirmation|proceed\s+with\s+payment\s+automatically|perform\s+payment\s+without\s+(?:customer\s+)?approval|pay\s+automatically)\b"
         ),
-        description="Directive to auto-approve purchase without explicit user confirmation.",
+        description="Directive to auto-approve purchase or perform payment without customer approval.",
     ),
     SecurityRule(
         rule_id="RULE_BYPASS_003",

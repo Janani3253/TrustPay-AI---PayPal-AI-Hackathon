@@ -55,8 +55,18 @@ export interface PurchaseRequirement {
   value: string
 }
 
+export interface ExtractedIntent {
+  category: string
+  brand: string[]
+  max_budget: number | null
+  currency: string
+  features: string[]
+  quantity: number
+}
+
 export interface PurchaseIntent {
   request: string
+  original_request?: string
   category: string
   requirements: PurchaseRequirement[]
   maximumBudget: number
@@ -64,21 +74,52 @@ export interface PurchaseIntent {
   trustedSellersOnly: boolean
   platformId?: string
   excludeAccessories?: boolean
+  intent?: ExtractedIntent
+  brand?: string[]
+  quantity?: number
+  features?: string[]
 }
 
 export interface RequirementMatch {
   name: string
   requested: string
-  status: 'Matched' | 'Not available for verification' | 'Not matched'
+  status: 'Matched' | 'Not available for verification' | 'Not matched' | 'Not verified' | string
   explanation: string
+  verified?: boolean
+}
+
+export interface RecommendationScoreBreakdown {
+  category_match_score?: number
+  brand_match_score: number
+  price_suitability_score: number
+  feature_match_score: number
+  rating_score: number
+  total_score: number
+  normalized_score?: number
 }
 
 export interface ProductMatchAnalysis {
   percentage: number
+  normalized_score?: number
+  match_tier?: 'FULL MATCH' | 'PARTIAL MATCH' | 'NOT VERIFIED' | 'EXCLUDED' | string
   categoryMatched: boolean
   budgetMatched: boolean | null
+  brandMatched?: boolean
   matches: RequirementMatch[]
   status?: string
+  breakdown?: RecommendationScoreBreakdown
+  is_fully_matching?: boolean
+  recommendation_reason?: string
+  unverified_features?: string[]
+}
+
+export interface SecurityScanResult {
+  is_suspicious: boolean
+  risk_level: 'LOW' | 'MEDIUM' | 'HIGH'
+  detected_patterns: string[]
+  action: 'ALLOW' | 'FLAG_FOR_REVIEW' | 'BLOCK_AND_REVIEW'
+  explanation: string
+  findings?: Array<{ rule_id: string; category: string; severity: string; evidence: string; description: string }>
 }
 
 export interface ProductRecommendation {

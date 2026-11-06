@@ -9,6 +9,7 @@ import type {
   ProductApiListResponse,
   ProductRecommendation,
   PurchaseIntent,
+  SecurityScanResult,
   Transaction,
 } from '../types'
 
@@ -97,20 +98,61 @@ export async function searchRecommendations(intent: PurchaseIntent): Promise<{
   if (intent.platformId !== DUMMYJSON_PLATFORM_ID) {
     throw new Error('Recommendations are available only for the DummyJSON Demo Store.')
   }
-  const response = await api.post<{
-    total: number
-    recommendations: Array<{
-      product: ProductApiListResponse['products'][number]
-      analysis: ProductRecommendation['analysis']
-    }>
-  }>('/recommendations/search', { intent })
-  return {
-    total: response.data.total,
-    recommendations: response.data.recommendations.map(({ product, analysis }) => ({
-      product: mapProduct(product),
-      analysis,
-    })),
+  try {
+    const response = await api.post<{
+      total: number
+      recommendations: Array<{
+        product: ProductApiListResponse['products'][number]
+        analysis: ProductRecommendation['analysis']
+      }>
+    }>('/ai/recommendations', { intent })
+    return {
+      total: response.data.total,
+      recommendations: response.data.recommendations.map(({ product, analysis }) => ({
+        product: mapProduct(product),
+        analysis,
+      })),
+    }
+  } catch {
+    const response = await api.post<{
+      total: number
+      recommendations: Array<{
+        product: ProductApiListResponse['products'][number]
+        analysis: ProductRecommendation['analysis']
+      }>
+    }>('/recommendations/search', { intent })
+    return {
+      total: response.data.total,
+      recommendations: response.data.recommendations.map(({ product, analysis }) => ({
+        product: mapProduct(product),
+        analysis,
+      })),
+    }
   }
+}
+
+export async function scanUntrustedContent(
+  content: string,
+  productId?: number,
+): Promise<SecurityScanResult> {
+  const response = await api.post<SecurityScanResult>('/security/scan-content', {
+    content,
+    product_id: productId,
+  })
+  return response.data
+}
+
+export async function reverifyIntentLock(intentId: string): Promise<{
+  reverification_passed: boolean
+  payment_allowed: boolean
+  reason: string
+}> {
+  const response = await api.post<{
+    reverification_passed: boolean
+    payment_allowed: boolean
+    reason: string
+  }>('/intentlock/reverify', { intent_id: intentId })
+  return response.data
 }
 
 export async function createBackendOrder(intent: PurchaseIntent): Promise<BackendOrder> {

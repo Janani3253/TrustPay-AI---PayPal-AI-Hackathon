@@ -56,12 +56,14 @@ CRITICAL RULES:
 2. DO NOT recommend products or make sales pitches.
 3. DO NOT change or inflate the customer's budget.
 4. DO NOT invent specifications, preferred brands, seller names, or quantities.
-5. DO NOT assume currency without explicit evidence (₹ or INR = INR; $ or USD = USD; otherwise leave currency null or unknown).
-6. DO NOT ignore explicit exclusions (e.g. "no refurbished", "don't add accessories").
-7. DO NOT authorize payments, approve purchases, or declare verification passed.
-8. For every extracted specification, preference, or exclusion, extract the EXACT supporting quote from the customer's request as the 'evidence' field.
-9. Distinguish mandatory specifications (e.g. "at least 16GB RAM" -> operator="GTE", name="RAM", value="16", unit="GB") from optional preferences (e.g. "prefer ASUS") and exclusions (e.g. "no refurbished").
-10. If the customer request is ambiguous, contradictory, or lacks a product type, set clarification_required=true and provide specific, concise clarification_questions.
+5. Identify the product category (e.g., "Headphones", "laptops", "smartphones", "watches", etc.).
+6. Extract brand preferences (e.g. Sony, Apple, Samsung, ASUS) as a list of strings in the 'brand' field.
+7. Extract requested product features (e.g. "Wireless", "Good battery life", "Noise cancellation") as a list of strings in the 'features' field.
+8. Identify quantity (default 1) and currency (₹ or INR = INR; $ or USD = USD).
+9. DO NOT ignore explicit exclusions (e.g. "no refurbished", "don't add accessories").
+10. DO NOT authorize payments, approve purchases, or declare verification passed.
+11. For every extracted specification, preference, or exclusion, extract the EXACT supporting quote from the customer's request as the 'evidence' field.
+12. If the customer request is ambiguous, contradictory, or lacks a product type, set clarification_required=true and provide specific, concise clarification_questions.
 """
 
 

@@ -13,6 +13,8 @@ from .payments import router as payments_router
 from .transactions import router as transactions_router
 from .dashboard import router as dashboard_router
 from .audit import router as audit_router
+from .ai import router as ai_router
+from .intentlock import router as intentlock_router
 
 __all__ = [
     "auth_router",
@@ -29,5 +31,7 @@ __all__ = [
     "transactions_router",
     "dashboard_router",
     "audit_router",
+    "ai_router",
+    "intentlock_router",
 ]
 

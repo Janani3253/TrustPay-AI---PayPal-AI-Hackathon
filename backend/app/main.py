@@ -41,6 +41,8 @@ from app.routers import (
     transactions_router,
     dashboard_router,
     audit_router,
+    ai_router,
+    intentlock_router,
 )
 from app.services.product_service import product_service
 from app.services.intent_service import intent_service
@@ -99,6 +101,8 @@ app.include_router(payments_router)
 app.include_router(transactions_router)
 app.include_router(dashboard_router)
 app.include_router(audit_router)
+app.include_router(ai_router)
+app.include_router(intentlock_router)
 
 
 @app.on_event("startup")
@@ -463,66 +467,23 @@ async def recommendations(
     intent = payload.get("intent")
     if not isinstance(intent, dict):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="An intent object is required.")
-    category = intent.get("category")
-    query = intent.get("request", "").strip()
-    try:
-        if category:
-            if not isinstance(category, str) or not re.fullmatch(r"[a-z0-9-]{1,80}", category):
-                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid product category.")
-            result = await product_service.list_products(category=category, limit=200)
-        else:
-            search_query = " ".join(query.split()[:3]).strip()
-            if search_query:
-                result = await product_service.search_products(query=search_query, limit=200)
-            else:
-                result = await product_service.list_products(limit=200)
-    except HTTPException:
-        raise
-    except Exception as err:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="The product catalogue service is currently unavailable.",
-        ) from err
-    enriched = []
-    budget = float(intent.get("maximumBudget", 0))
-    for norm_prod in result.products:
-        product = norm_prod.model_dump(by_alias=True)
-        matched_category = not category or product.get("category") == category
-        currency_matches = intent.get("currency") == "USD"
-        total = float(product.get("price", 0)) * 1.05 + FEE_SHIPPING
-        budget_matches = currency_matches and total <= budget
-        matches = [
+
+    from app.services.recommendation_service import recommendation_service
+    rec_result = await recommendation_service.get_recommendations(intent_data=intent, limit=100)
+    add_audit(user["id"], "Product API data retrieved", f"Retrieved {rec_result.total} recommendation product(s).")
+    return {
+        "total": rec_result.total,
+        "recommendations": [
             {
-                "name": requirement.get("name", "Specification"),
-                "requested": requirement.get("value", ""),
-                "status": "Not available for verification",
-                "explanation": "The public product catalogue does not provide this technical specification.",
+                "product": r.product,
+                "analysis": r.analysis,
+                "score": r.score,
+                "is_fully_matching": r.is_fully_matching,
+                "recommendation_reason": r.recommendation_reason,
             }
-            for requirement in intent.get("requirements", [])
-        ]
-        available_signals = 1 + int(currency_matches)
-        percentage = round(
-            (int(matched_category) + int(bool(budget_matches))) / max(available_signals, 1) * 100
-        )
-        recommendation_status = (
-            "Budget Exceeded" if currency_matches and not budget_matches
-            else "Currency Mismatch" if not currency_matches
-            else "Matches Requirements" if matched_category and not matches
-            else "Specification Mismatch" if matched_category and matches
-            else "Category Mismatch"
-        )
-        enriched.append({
-            "product": product,
-            "analysis": {
-                "percentage": percentage,
-                "categoryMatched": matched_category,
-                "budgetMatched": budget_matches if currency_matches else None,
-                "matches": matches,
-                "status": recommendation_status,
-            },
-        })
-    add_audit(user["id"], "Product API data retrieved", f"Retrieved {len(enriched)} recommendation product(s).")
-    return {"recommendations": enriched, "total": len(enriched)}
+            for r in rec_result.recommendations
+        ],
+    }
 
 
 # Legacy cart routes moved to cart_router

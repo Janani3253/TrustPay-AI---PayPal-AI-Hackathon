@@ -32,6 +32,13 @@ async def parse_intent(
             detail="Only the DummyJSON Demo Store is supported.",
         )
 
+    from app.core.config import settings
+    if not settings.is_gemini_configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Gemini AI is not configured. Please set GEMINI_API_KEY.",
+        )
+
     try:
         user_id = int(user["id"] if isinstance(user, dict) else user.id)
         intent = await intent_service.parse_shopping_intent(payload)

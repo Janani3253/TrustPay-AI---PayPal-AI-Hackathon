@@ -121,3 +121,34 @@ class GeminiSecurityAnalysis(BaseModel):
     findings: List[GeminiSecurityFinding] = Field(default_factory=list)
     summary: str
 
+
+class ContentScanRiskLevel(str, Enum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+
+
+class ContentScanAction(str, Enum):
+    ALLOW = "ALLOW"
+    FLAG_FOR_REVIEW = "FLAG_FOR_REVIEW"
+    BLOCK_AND_REVIEW = "BLOCK_AND_REVIEW"
+
+
+class ContentScanRequest(BaseModel):
+    """Payload for POST /security/scan-content."""
+    content: str = Field(..., min_length=1, max_length=50000, description="Untrusted text, website content, or product description to scan")
+    product_id: Optional[int] = Field(default=None, description="Optional associated product ID")
+    source: Optional[str] = Field(default="shopping_website", description="Origin of untrusted content")
+
+
+class ContentScanResponse(BaseModel):
+    """Response matching the exact task specification for POST /security/scan-content."""
+    is_suspicious: bool = Field(description="True if malicious or suspicious instructions detected")
+    risk_level: ContentScanRiskLevel = Field(description="Risk classification: LOW, MEDIUM, or HIGH")
+    detected_patterns: List[str] = Field(default_factory=list, description="List of detected attack patterns")
+    action: ContentScanAction = Field(description="Action to take: ALLOW, FLAG_FOR_REVIEW, or BLOCK_AND_REVIEW")
+    explanation: str = Field(default="", description="Detailed human-readable explanation")
+    findings: List[SecurityFinding] = Field(default_factory=list, description="Granular finding details")
+    scanned_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    content_hash: str = Field(default="")
+

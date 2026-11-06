@@ -85,6 +85,8 @@ class StructuredIntentExtraction(BaseModel):
         description="Explicitly excluded product conditions",
     )
     quantity: int = Field(default=1, ge=1, le=100, description="Requested product count")
+    brand: List[str] = Field(default_factory=list, description="Extracted brand names or preferences")
+    features: List[str] = Field(default_factory=list, description="Extracted required product features")
     clarification_required: bool = Field(default=False, description="Whether request is ambiguous or incomplete")
     clarification_questions: List[str] = Field(
         default_factory=list,
@@ -136,4 +138,58 @@ class PurchaseIntentResponse(BaseModel):
     clarification_required: bool = Field(default=False, description="Flag indicating need for customer clarification")
     clarification_questions: List[str] = Field(default_factory=list, description="Clarifying questions")
     unresolved_requirements: List[str] = Field(default_factory=list, description="Unresolved constraints")
+
+
+class ExtractedIntentData(BaseModel):
+    """
+    Standard customer intent structure matching task specification:
+    category, brand, max_budget, currency, features, quantity.
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    category: str = Field(default="", description="Product category")
+    brand: List[str] = Field(default_factory=list, description="Extracted brand preferences")
+    max_budget: Optional[float] = Field(default=None, description="Maximum budget limit")
+    currency: str = Field(default="USD", description="Currency code (USD, INR, etc.)")
+    features: List[str] = Field(default_factory=list, description="Required product features")
+    quantity: int = Field(default=1, ge=1, description="Requested quantity")
+
+
+class AnalyzeIntentRequest(BaseModel):
+    """Request payload for POST /ai/analyze-intent."""
+    model_config = ConfigDict(extra="ignore")
+
+    request: str = Field(..., min_length=1, max_length=2000, description="Natural-language customer shopping request")
+    category: Optional[str] = Field(default="", description="Optional category hint")
+    maximumBudget: Optional[float] = Field(default=None, description="Optional customer budget limit")
+    currency: Optional[str] = Field(default=None, description="Optional currency code")
+    platformId: str = Field(default="dummyjson", description="Target shopping platform")
+    trustedSellersOnly: bool = Field(default=True, description="Require trusted sellers")
+
+
+class AnalyzeIntentResponse(BaseModel):
+    """
+    Unified response for POST /ai/analyze-intent.
+    Returns original request stored separately from structured intent,
+    while providing backward compatibility with existing frontend types.
+    """
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    original_request: str = Field(description="Exact original customer shopping request")
+    intent: ExtractedIntentData = Field(description="Structured purchase intent")
+    clarification_required: bool = Field(default=False)
+    clarification_questions: List[str] = Field(default_factory=list)
+    extraction_method: str = Field(default="GEMINI", description="GEMINI or RULE_BASED_FALLBACK")
+    status: str = Field(default="READY_FOR_REVIEW")
+
+    # Backward compatibility with frontend PurchaseIntent interface
+    request: str = Field(default="", description="Original request alias")
+    category: str = Field(default="", description="Category alias")
+    requirements: List[PurchaseRequirement] = Field(default_factory=list)
+    maximumBudget: float = Field(default=0.0)
+    currency: Literal["USD", "INR"] = Field(default="USD")
+    trustedSellersOnly: bool = Field(default=True)
+    platformId: str = Field(default="dummyjson")
+    excludeAccessories: bool = Field(default=False)
+    structured_intent: Optional[StructuredIntentExtraction] = None
 
