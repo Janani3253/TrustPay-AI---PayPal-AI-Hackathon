@@ -8,18 +8,17 @@ import {
   ShoppingBag, ShoppingCart, Sparkles, Trash2, X,
 } from 'lucide-react'
 import { Brand } from '../components/common/Brand'
-import { MarketplaceCatalogPage } from '../components/marketplace/MarketplaceCatalogPage'
 import { useApp } from '../context/AppContext'
 import { formatMoney } from '../mock/data'
 import { login, register } from '../services/authService'
 import { extractIntent } from '../services/intentService'
-import { getProduct, getProductCategories, getProducts, mapProduct, productDataSource } from '../services/productService'
+import { DUMMYJSON_PLATFORM_ID, getProduct, getProductCategories, getProductList, mapProduct, productDataSource } from '../services/productService'
 import { calculateCartTotals } from '../services/cartService'
 import { getOrderFingerprint } from '../utils/order'
 import {
   addCartProduct, approveBackendOrder, clearBackendCart, createBackendOrder,
   createPayPalOrder, capturePayPalOrder, getAuditEvents, getBackendError,
-  getDashboardSummary, getPlatforms, removeCartProduct, searchRecommendations,
+  getBackendOrder, getCart, getDashboardSummary, getPlatforms, removeCartProduct, searchRecommendations,
   updateCartProduct, verifyBackendAudit, verifyBackendOrder,
   type ShoppingPlatform,
 } from '../services/backendService'
@@ -50,7 +49,7 @@ function ProductTile({ product, matched = false, matchPercent = '96%' }: { produ
       setDetailProduct(await getProduct(product.id))
     } catch (error) {
       console.error('Could not load product details from Demo Product API.', error)
-      setDetailError('Product details could not be loaded from Demo Product API.')
+      setDetailError(getBackendError(error, 'Product details could not be loaded from Demo Product API.'))
     } finally {
       setDetailLoading(false)
     }
@@ -73,7 +72,7 @@ export function LandingPage() {
       <div className="hero-visual"><div className="visual-glow" /><div className="visual-top"><div><span className="tiny-label">ILLUSTRATIVE DEMO · NOT LIVE API DATA</span><strong><span className="green-dot" /> Example order preview</strong></div><ShieldCheck size={32} /></div><div className="visual-order"><div className="visual-product"><div className="visual-laptop"><div /></div><div><b>Example product</b><span>Specifications unavailable</span></div><b>Sample price</b></div><div className="intent-line"><CheckCircle2 size={15} /><span>Simulated intent analysis</span><b>DEMO</b></div><div className="visual-line"><span>Seller data unavailable</span><CircleAlert size={15} /></div><div className="visual-line"><span>Currency and budget require review</span><CircleAlert size={15} /></div></div><div className="visual-footer"><ShieldCheck size={17} /><span>IntentLock frontend demonstration</span><small>NOT A SECURITY CERTIFICATION</small></div><div className="floating-lock"><Fingerprint size={18} /><span>Customer intent snapshot</span></div></div>
     </section>
     <section id="how" className="landing-section"><div className="section-heading"><span className="eyebrow">A SAFER WAY TO SHOP</span><h2>Every purchase. <span>Double-checked.</span></h2><p>Simple for you. Smarter protection behind the scenes.</p></div><div className="steps-grid">{[['01','Tell us what you need','Describe what you are looking for in your own words.'],['02','Review API product data','Compare catalogue details and unavailable fields.'],['03','Approve the exact order','Review demo checks before a simulated payment.']].map(([n,title,copy]) => <div className="step-card" key={n}><span className="step-num">{n}</span><div className="step-icon"><ShoppingBag size={21} /></div><h3>{title}</h3><p>{copy}</p></div>)}</div></section>
-    <section className="landing-section marketplace-landing"><div className="section-heading"><span className="eyebrow">CATALOGUE PROVIDERS</span><h2>Marketplace access, <span>clearly labelled.</span></h2><p>Provider readiness is not the same as a live connection. Current health is shown in the signed-in catalogue using backend status.</p></div><div className="marketplace-readiness-grid"><div><b>DummyJSON Demo Store</b><span className="readiness-demo">Demo catalogue available</span></div><div><b>Amazon India</b><span>Requires official Creators API access</span></div><div><b>Flipkart India</b><span>Requires approved Affiliate API access</span></div><div><b>Myntra India</b><span>Official partner catalogue access not verified</span></div></div></section>
+    <section className="landing-section marketplace-landing"><div className="section-heading"><span className="eyebrow">SUPPORTED CATALOGUE</span><h2>One demo store, <span>clearly labelled.</span></h2><p>Only products returned by the integrated DummyJSON Demo Store are available in this prototype.</p></div><div className="marketplace-readiness-grid"><div><b>DummyJSON Demo Store</b><span className="readiness-demo">Available · Demo catalogue</span></div><div><b>Other marketplaces</b><span>Unavailable · No marketplace products are shown or substituted</span></div></div></section>
     <section id="security" className="security-banner"><div className="banner-icon"><ShieldCheck size={26} /></div><div><span className="eyebrow">INTRODUCING INTENTLOCK</span><h2>Your original request is the source of truth.</h2><p>Review simulated checks for unauthorized changes, estimated fees, untrusted instructions, and last-minute cart changes.</p></div><ButtonLink to="/shopping-request" variant="btn-light" icon={<ArrowRight size={16} />}>Try IntentLock</ButtonLink></section>
     <footer className="landing-footer"><Brand /><span>© 2026 TrustPay AI. Frontend demo.</span><div><Link to="/login">Sign in</Link><Link to="/register">Create account</Link></div></footer>
   </div>
@@ -180,14 +179,14 @@ export function PlatformSelectionPage() {
     return () => { active = false }
   }, [])
   const choose = (platform: ShoppingPlatform) => {
-    if (!platform.supported) {
-      notify(`${platform.name} is not configured for shopping yet.`, 'info')
+    if (platform.id !== DUMMYJSON_PLATFORM_ID || !platform.supported) {
+      notify(`${platform.name} is unavailable. Only the DummyJSON Demo Store is currently integrated.`, 'info')
       return
     }
     setSelectedPlatformId(platform.id)
     navigate('/products')
   }
-  return <><PageTitle eyebrow="STEP 1 · SHOPPING SOURCE" title="Choose a shopping platform" description="Choose a supported store first. The catalogue shown next will come from that selected platform." />{error && <div className="form-error">{error}<button className="btn btn-outline btn-sm" onClick={() => { setError(''); setLoading(true); getPlatforms().then(setPlatforms).catch((cause: unknown) => setError(getBackendError(cause, 'Shopping platforms could not be loaded.'))).finally(() => setLoading(false)) }}>Retry</button></div>}{loading ? <div className="panel api-state"><span className="spinner" /><p>Loading available platforms from backend…</p></div> : <div className="platform-grid">{platforms.map((platform) => <button key={platform.id} className={`panel platform-card ${platform.supported ? 'platform-enabled' : 'platform-disabled'} ${selectedPlatformId === platform.id ? 'platform-selected' : ''}`} onClick={() => choose(platform)} disabled={!platform.supported}><span className="platform-icon"><ShoppingBag size={24} /></span><span className="platform-title">{platform.name}</span><span className={`status-chip ${platform.supported ? 'status-success' : 'status-warning'}`}><i />{platform.supported ? 'Available' : 'Not integrated'}</span><span className="platform-description">{platform.description}</span><span className="platform-footnote">{platform.demo_only ? 'Demo catalogue · DummyJSON API' : 'No product access will be attempted'}</span>{selectedPlatformId === platform.id && <span className="platform-current">Currently selected</span>}</button>)}</div>}{!loading && !platforms.some((platform) => platform.supported) && !error && <div className="empty-state"><CircleAlert size={25} /><h3>No supported platforms</h3><p>The backend currently has no product platform enabled.</p></div>}<div className="info-banner"><CircleAlert size={18} /><span>Amazon, Flipkart, and Myntra are listed as unsupported; this prototype does not connect to their catalogues. Only a platform marked Available can be selected.</span></div></>
+  return <><PageTitle eyebrow="STEP 1 · SHOPPING SOURCE" title="Choose a shopping platform" description="Only the integrated DummyJSON Demo Store can be used for shopping. Other providers are unavailable and will not be substituted with demo products." />{error && <div className="form-error">{error}<button className="btn btn-outline btn-sm" onClick={() => { setError(''); setLoading(true); getPlatforms().then(setPlatforms).catch((cause: unknown) => setError(getBackendError(cause, 'Shopping platforms could not be loaded.'))).finally(() => setLoading(false)) }}>Retry</button></div>}{loading ? <div className="panel api-state"><span className="spinner" /><p>Loading available platforms from backend…</p></div> : <div className="platform-grid">{platforms.map((platform) => { const available = platform.id === DUMMYJSON_PLATFORM_ID && platform.supported; return <button key={platform.id} className={`panel platform-card ${available ? 'platform-enabled' : 'platform-disabled'} ${selectedPlatformId === platform.id ? 'platform-selected' : ''}`} onClick={() => choose(platform)} disabled={!available}><span className="platform-icon"><ShoppingBag size={24} /></span><span className="platform-title">{platform.name}</span><span className={`status-chip ${available ? 'status-success' : 'status-warning'}`}><i />{available ? 'Available' : 'Unavailable'}</span><span className="platform-description">{platform.description}</span><span className="platform-footnote">{available ? 'Demo catalogue · DummyJSON API' : 'No product access will be attempted'}</span>{selectedPlatformId === platform.id && <span className="platform-current">Currently selected</span>}</button> })}</div>}{!loading && !platforms.some((platform) => platform.id === DUMMYJSON_PLATFORM_ID && platform.supported) && !error && <div className="empty-state"><CircleAlert size={25} /><h3>No supported platforms</h3><p>The backend currently has no product platform enabled.</p></div>}<div className="info-banner"><CircleAlert size={18} /><span>Only DummyJSON is integrated. Amazon, Flipkart, and Myntra are unavailable; no marketplace results or demo substitutions are shown for them.</span></div></>
 }
 
 function TransactionsTable({ rows }: { rows: ReturnType<typeof useApp>['transactions'] }) {
@@ -200,7 +199,8 @@ export function LegacyProductsPage() {
   const [sort, setSort] = useState('Recommended')
   const [maxPrice, setMaxPrice] = useState('')
   const [items, setItems] = useState<Product[]>([])
-  const [visibleCount, setVisibleCount] = useState(24)
+  const [total, setTotal] = useState(0)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [categories, setCategories] = useState<ProductCategory[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -211,50 +211,78 @@ export function LegacyProductsPage() {
 
   useEffect(() => {
     let active = true
-    getProductCategories().then((result) => {
+    getProductCategories(selectedPlatformId ?? DUMMYJSON_PLATFORM_ID).then((result) => {
       if (active) setCategories(result)
     }).catch((cause: unknown) => {
       console.error('Could not load product categories from Demo Product API.', cause)
-      if (active) setCategoryError('Product categories could not be loaded.')
+      if (active) setCategoryError(getBackendError(cause, 'Product categories could not be loaded.'))
     })
     return () => { active = false }
-  }, [])
+  }, [selectedPlatformId])
 
   useEffect(() => {
     let active = true
     const timer = window.setTimeout(() => {
       setLoading(true)
       setError('')
-      getProducts({ query: search, category: category || undefined })
+      getProductList({
+        query: search,
+        category: category || undefined,
+        limit: 24,
+        skip: 0,
+        platform: selectedPlatformId ?? DUMMYJSON_PLATFORM_ID,
+      })
         .then((result) => {
           if (!active) return
-          setItems(result)
+          setItems(result.products.map(mapProduct))
+          setTotal(result.total)
           setLoading(false)
           if (!auditLoaded.current) {
-            recordAudit('Product API data retrieved', `Retrieved ${result.length} products from Demo Product API.`)
+            recordAudit('Product API data retrieved', `Retrieved ${result.products.length} products from Demo Product API.`)
             auditLoaded.current = true
           }
         })
         .catch((cause: unknown) => {
           console.error('Could not load products from Demo Product API.', cause)
           if (active) {
-            setError('Products could not be loaded from Demo Product API. Check your connection and retry.')
+            setError(getBackendError(cause, 'Products could not be loaded from Demo Product API. Check your connection and retry.'))
             setItems([])
+            setTotal(0)
             setLoading(false)
           }
         })
     }, search ? 300 : 0)
     return () => { active = false; window.clearTimeout(timer) }
-  }, [search, category, retry, recordAudit])
+  }, [search, category, retry, recordAudit, selectedPlatformId])
 
+  const loadMore = async () => {
+    if (loadingMore || items.length >= total) return
+    setLoadingMore(true)
+    setError('')
+    try {
+      const result = await getProductList({
+        query: search,
+        category: category || undefined,
+        limit: 24,
+        skip: items.length,
+        platform: selectedPlatformId ?? DUMMYJSON_PLATFORM_ID,
+      })
+      setItems((current) => [...current, ...result.products.map(mapProduct)])
+      setTotal(result.total)
+    } catch (cause) {
+      setError(getBackendError(cause, 'More products could not be loaded from the backend.'))
+    } finally {
+      setLoadingMore(false)
+    }
+  }
   const filtered = useMemo(() => items
     .filter((product) => !maxPrice || product.price <= Number(maxPrice))
     .sort((left, right) => sort === 'Price: low to high' ? left.price - right.price : sort === 'Price: high to low' ? right.price - left.price : right.rating - left.rating), [items, maxPrice, sort])
-  return <><PageTitle eyebrow="PRODUCT CATALOGUE" title="Find your next favorite" description="Products below are fetched from the platform selected in your dashboard." action={<ButtonLink to="/cart" variant="btn-outline" icon={<ShoppingCart size={16} />}>View cart</ButtonLink>} /><div className="api-source-strip"><span className="api-live-dot" />Selected platform: {selectedPlatformId === 'dummyjson' ? 'DummyJSON Demo Store' : selectedPlatformId}<span>{productDataSource} · USD prices, as provided by the catalogue.</span></div><div className="catalog-toolbar"><label className="search-field"><Search size={17} /><input placeholder="Search products via API..." value={search} onChange={(e) => { setSearch(e.target.value); setVisibleCount(24) }} /></label><select aria-label="Filter by product category" value={category} onChange={(e) => { setCategory(e.target.value); setVisibleCount(24) }}><option value="">All categories</option>{categories.map((item) => <option value={item.slug} key={item.slug}>{item.name}</option>)}</select><label className="price-filter">Under $<input aria-label="Maximum price in USD" type="number" min="0" placeholder="Any" value={maxPrice} onChange={(e) => setMaxPrice(e.target.value)} /></label><select aria-label="Sort products by price" value={sort} onChange={(e) => setSort(e.target.value)}><option>Recommended</option><option>Price: low to high</option><option>Price: high to low</option></select></div>{categoryError && <div className="info-banner warning-banner"><CircleAlert size={18} /><span>{categoryError} Category filter may be unavailable.</span><button className="btn btn-outline btn-sm" onClick={() => { setCategoryError(''); getProductCategories().then(setCategories).catch((cause: unknown) => { console.error(cause); setCategoryError('Product categories could not be loaded.') }) }}>Retry categories</button></div>}{loading ? <div className="panel api-state"><span className="spinner" /><p>Loading selected platform catalogue…</p></div> : error ? <div className="panel api-error"><CircleAlert size={25} /><h2>Backend catalogue unavailable</h2><p>{error}</p><button className="btn btn-primary" onClick={() => { setVisibleCount(24); setRetry((value) => value + 1) }}>Retry product request</button></div> : <><div className="api-results-label">{filtered.length} product{filtered.length === 1 ? '' : 's'} from selected platform</div><div className="product-grid">{filtered.slice(0, visibleCount).map((product) => <ProductTile key={product.id} product={product} />)}</div>{filtered.length === 0 && <div className="empty-state"><Search size={28} /><h3>No products found</h3><p>Try a different search, category, or price limit.</p></div>}{visibleCount < filtered.length && <div className="load-more-wrap"><button className="btn btn-outline" onClick={() => setVisibleCount((count) => count + 24)}>Load more products</button></div>}</>}</>
+  return <><PageTitle eyebrow="PRODUCT CATALOGUE" title="Find your next favorite" description="Only products returned by the selected DummyJSON Demo Store are shown." action={<ButtonLink to="/cart" variant="btn-outline" icon={<ShoppingCart size={16} />}>View cart</ButtonLink>} /><div className="api-source-strip"><span className="api-live-dot" />Selected platform: DummyJSON Demo Store<span>{productDataSource} · USD prices, as provided by the catalogue.</span></div><div className="catalog-toolbar"><label className="search-field"><Search size={17} /><input placeholder="Search products via API..." value={search} onChange={(e) => setSearch(e.target.value)} /></label><select aria-label="Filter by product category" value={category} onChange={(e) => setCategory(e.target.value)}><option value="">All categories</option>{categories.map((item) => <option value={item.slug} key={item.slug}>{item.name}</option>)}</select><label className="price-filter">Under $<input aria-label="Maximum price in USD" type="number" min="0" placeholder="Any" value={maxPrice} onChange={(e) => setMaxPrice(e.target.value)} /></label><select aria-label="Sort products by price" value={sort} onChange={(e) => setSort(e.target.value)}><option>Recommended</option><option>Price: low to high</option><option>Price: high to low</option></select></div>{categoryError && <div className="info-banner warning-banner"><CircleAlert size={18} /><span>{categoryError} Category filter may be unavailable.</span><button className="btn btn-outline btn-sm" onClick={() => { setCategoryError(''); getProductCategories(selectedPlatformId ?? DUMMYJSON_PLATFORM_ID).then(setCategories).catch((cause: unknown) => { setCategoryError(getBackendError(cause, 'Product categories could not be loaded.')) }) }}>Retry categories</button></div>}{loading ? <div className="panel api-state"><span className="spinner" /><p>Loading selected platform catalogue…</p></div> : error ? <div className="panel api-error"><CircleAlert size={25} /><h2>Backend catalogue unavailable</h2><p>{error}</p><button className="btn btn-primary" onClick={() => setRetry((value) => value + 1)}>Retry product request</button></div> : <><div className="api-results-label">{filtered.length} product{filtered.length === 1 ? '' : 's'} displayed · {total} matching products</div><div className="product-grid">{filtered.map((product) => <ProductTile key={product.id} product={product} />)}</div>{filtered.length === 0 && <div className="empty-state"><Search size={28} /><h3>No products found</h3><p>Try a different search, category, or price limit.</p></div>}{items.length < total && <div className="load-more-wrap"><button className="btn btn-outline" onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore ? 'Loading…' : 'Load more products'}</button></div>}</>}</>
 }
 
 export function ProductsPage() {
-  return <MarketplaceCatalogPage />
+  return <LegacyProductsPage />
 }
 
 export function RequestPage() {
@@ -265,22 +293,26 @@ export function RequestPage() {
   const [category, setCategory] = useState(intent?.category ?? '')
   const [categories, setCategories] = useState<ProductCategory[]>([])
   const [platforms, setPlatforms] = useState<ShoppingPlatform[]>([])
-  const platformId = selectedPlatformId ?? intent?.platformId ?? ''
+  const platformId = selectedPlatformId ?? ''
   const [categoryError, setCategoryError] = useState('')
   const [trustedSellersOnly, setTrustedSellersOnly] = useState(intent?.trustedSellersOnly ?? true)
   const [working, setWorking] = useState(false)
   const [error, setError] = useState('')
   useEffect(() => {
     let active = true
-    getProductCategories().then((result) => { if (active) setCategories(result) })
-      .catch((cause: unknown) => { console.error('Could not load request categories.', cause); if (active) setCategoryError('API categories are unavailable. You can still submit a request without a category.') })
+    getProductCategories(selectedPlatformId ?? DUMMYJSON_PLATFORM_ID).then((result) => { if (active) setCategories(result) })
+      .catch((cause: unknown) => { console.error('Could not load request categories.', cause); if (active) setCategoryError(getBackendError(cause, 'API categories are unavailable. You can still submit a request without a category.')) })
     getPlatforms().then((result) => { if (active) setPlatforms(result) })
-      .catch((cause: unknown) => { console.error('Could not load supported platforms.', cause); if (active) setCategoryError('Shopping platforms could not be loaded from the backend.') })
+      .catch((cause: unknown) => { console.error('Could not load supported platforms.', cause); if (active) setCategoryError(getBackendError(cause, 'Shopping platforms could not be loaded from the backend.')) })
     return () => { active = false }
-  }, [])
+  }, [selectedPlatformId])
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     if (!request.trim() || budget < 1) { setError('Describe your purchase and enter a valid budget.'); return }
+    if (platformId !== DUMMYJSON_PLATFORM_ID) {
+      setError('Only the DummyJSON Demo Store is currently available for shopping requests.')
+      return
+    }
     setError('')
     setWorking(true)
     try {
@@ -299,11 +331,12 @@ export function ProductResultsPage() {
   const { intent, recordAudit } = useApp()
   const navigate = useNavigate()
   const [items, setItems] = useState<ProductRecommendation[]>([])
-  const [loading, setLoading] = useState(true)
+  const [total, setTotal] = useState(0)
+  const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [retry, setRetry] = useState(0)
   useEffect(() => {
-    if (!intent) return
+    if (!intent || intent.platformId !== DUMMYJSON_PLATFORM_ID) return
     let active = true
     const timer = window.setTimeout(() => {
       setLoading(true)
@@ -311,15 +344,16 @@ export function ProductResultsPage() {
       searchRecommendations(intent)
         .then((result) => {
           if (active) {
-            setItems(result)
+            setItems(result.recommendations)
+            setTotal(result.total)
             setLoading(false)
-            recordAudit('Product API data retrieved', `Backend searched the supported product catalogue and returned ${result.length} recommendation(s).`)
+            recordAudit('Product API data retrieved', `Backend searched the DummyJSON catalogue and returned ${result.total} recommendation(s).`)
           }
         })
         .catch((cause: unknown) => {
           console.error('Could not fetch intent-matched products.', cause)
           if (active) {
-            setError('Matching products could not be loaded from Demo Product API.')
+            setError(getBackendError(cause, 'Matching products could not be loaded from Demo Product API.'))
             setItems([])
             setLoading(false)
           }
@@ -328,24 +362,30 @@ export function ProductResultsPage() {
     return () => { active = false; window.clearTimeout(timer) }
   }, [intent, retry, recordAudit])
   const analyzed = [...items].sort((left, right) => right.analysis.percentage - left.analysis.percentage)
-  return <><PageTitle eyebrow="PERSONALIZED MATCHES" title="Products for your intent" description="Backend recommendation status and API product fields are shown without frontend security decisions." action={<ButtonLink to="/shopping-request" variant="btn-outline">Edit request</ButtonLink>} />{intent ? <div className="intent-summary-strip"><Sparkles size={17} /><span><b>Original request:</b> “{intent.request}”</span><span className="summary-budget">Budget {formatMoney(intent.maximumBudget, intent.currency)}</span></div> : <div className="info-banner"><CircleAlert size={18} /><span>Start with a shopping request for personalized matches.</span><Link to="/shopping-request">Create request</Link></div>}<div className="api-source-strip"><span className="api-live-dot" />{productDataSource}<span>Recommendation statuses come from the backend.</span></div>{loading && <div className="panel api-state"><span className="spinner" /><p>Searching supported product catalogue…</p></div>}{error && <div className="panel api-error"><CircleAlert size={25} /><h2>Backend recommendation service unavailable</h2><p>{error}</p><button className="btn btn-primary" onClick={() => setRetry((value) => value + 1)}>Retry product search</button></div>}{!loading && !error && <><div className="results-caption"><span>{analyzed.length} backend recommendation{analyzed.length === 1 ? '' : 's'}</span></div><div className="product-grid">{analyzed.length ? analyzed.map(({ product, analysis }) => <div key={product.id} className="result-product"><div className="match-summary"><span className="match-score">{analysis.percentage}%</span><div><b>{analysis.categoryMatched ? 'Category match' : 'Category mismatch'}</b><small>Backend recommendation result</small></div><span className="status-chip status-warning"><i />{analysis.status ?? 'Needs Review'}</span></div><ProductTile product={product} matched matchPercent={`${analysis.percentage}%`} /><div className="match-analysis"><b>Backend-reported requirements</b>{analysis.matches.length ? analysis.matches.map((requirement) => <div key={requirement.name}><span>{requirement.name}: {requirement.requested}</span><em>{requirement.status}</em></div>) : <p>No technical requirements were extracted.</p>}<div><span>Seller</span><em>Not available for verification</em></div><div><span>Budget comparison</span><em>{analysis.budgetMatched === null ? `Unavailable (${intent?.currency} budget, USD API price)` : analysis.budgetMatched ? 'Within budget including estimated fees' : 'Above budget including estimated fees'}</em></div><details><summary>API description (untrusted text)</summary><p>{product.description}</p></details></div></div>) : <div className="empty-state"><PackageCheck size={30} /><h3>No API products found</h3><p>Try editing the request or browsing all product categories.</p><button className="btn btn-outline" onClick={() => navigate('/products')}>Browse products</button></div>}</div></>}</>
+  return <><PageTitle eyebrow="PERSONALIZED MATCHES" title="Products for your intent" description="Backend recommendation status and API product fields are shown without frontend security decisions." action={<ButtonLink to="/shopping-request" variant="btn-outline">Edit request</ButtonLink>} />{intent ? <div className="intent-summary-strip"><Sparkles size={17} /><span><b>Original request:</b> “{intent.request}”</span><span className="summary-budget">Budget {formatMoney(intent.maximumBudget, intent.currency)}</span></div> : <div className="info-banner"><CircleAlert size={18} /><span>Start with a shopping request for personalized matches.</span><Link to="/shopping-request">Create request</Link></div>}{intent && intent.platformId !== DUMMYJSON_PLATFORM_ID && <div className="info-banner warning-banner"><CircleAlert size={18} /><span>This saved request uses an unavailable platform. Select the DummyJSON Demo Store and create a new request; products will not be substituted.</span><Link to="/platforms">Choose platform</Link></div>}<div className="api-source-strip"><span className="api-live-dot" />{productDataSource}<span>Recommendation statuses come from the backend.</span></div>{loading && <div className="panel api-state"><span className="spinner" /><p>Searching supported product catalogue…</p></div>}{error && <div className="panel api-error"><CircleAlert size={25} /><h2>Backend recommendation service unavailable</h2><p>{error}</p><button className="btn btn-primary" onClick={() => setRetry((value) => value + 1)}>Retry product search</button></div>}{!loading && !error && (!intent || intent.platformId === DUMMYJSON_PLATFORM_ID) && <><div className="results-caption"><span>{total} backend recommendation{total === 1 ? '' : 's'}</span></div><div className="product-grid">{analyzed.length ? analyzed.map(({ product, analysis }) => <div key={product.id} className="result-product"><div className="match-summary"><span className="match-score">{analysis.percentage}%</span><div><b>{analysis.categoryMatched ? 'Category match' : 'Category mismatch'}</b><small>Backend recommendation result</small></div><span className="status-chip status-warning"><i />{analysis.status ?? 'Needs Review'}</span></div><ProductTile product={product} matched matchPercent={`${analysis.percentage}%`} /><div className="match-analysis"><b>Backend-reported requirements</b>{analysis.matches.length ? analysis.matches.map((requirement) => <div key={requirement.name}><span>{requirement.name}: {requirement.requested}</span><em>{requirement.status}</em></div>) : <p>No technical requirements were extracted.</p>}<div><span>Seller</span><em>Not available for verification</em></div><div><span>Budget comparison</span><em>{analysis.budgetMatched === null ? `Unavailable (${intent?.currency} budget, USD API price)` : analysis.budgetMatched ? 'Within budget including estimated fees' : 'Above budget including estimated fees'}</em></div><details><summary>API description (untrusted text)</summary><p>{product.description}</p></details></div></div>) : <div className="empty-state"><PackageCheck size={30} /><h3>{intent ? 'No API products found' : 'No purchase request yet'}</h3><p>{intent ? 'Try editing the request or browsing all product categories.' : 'Create a request to search for products.'}</p><button className="btn btn-outline" onClick={() => navigate(intent ? '/products' : '/shopping-request')}>{intent ? 'Browse products' : 'Create request'}</button></div>}</div></>}</>
 }
 
 export function CartPage() {
-  const { cart, intent, setQuantity, removeFromCart, notify } = useApp()
-  const [cartError, setCartError] = useState('')
-  const totals = calculateCartTotals(cart)
+  const { cart, cartTotals, cartSyncError, intent, setQuantity, removeFromCart, replaceCart, notify } = useApp()
+  const [mutationError, setMutationError] = useState('')
+  const cartError = mutationError || cartSyncError || ''
+  const totals = cartTotals ?? calculateCartTotals(cart)
   const budgetCurrencyMatches = Boolean(intent && totals.currency === intent.currency)
   const overBudget = Boolean(budgetCurrencyMatches && intent && totals.total > intent.maximumBudget)
   const budgetUnavailable = Boolean(intent && totals.currency && !budgetCurrencyMatches)
   const blocked = overBudget || budgetUnavailable || totals.hasMixedCurrencies
   const display = (amount: number) => formatMoney(amount, totals.currency ?? 'USD')
   const runCartUpdate = async (operation: () => Promise<void>, update: () => void) => {
-    setCartError('')
-    try { await operation(); update() }
+    setMutationError('')
+    try {
+      await operation()
+      update()
+      const currentCart = await getCart()
+      replaceCart(currentCart.items, currentCart.totals)
+    }
     catch (error) {
       const message = getBackendError(error, 'The backend could not update your cart.')
-      setCartError(message)
+      setMutationError(message)
       notify(message, 'error')
     }
   }
@@ -455,12 +495,19 @@ export function PaymentPage() {
     capturePayPalOrder(paypalOrderId)
       .then(async (result) => {
         if (!active) return
+        let productNames = cart.map((item) => item.product.name).join(', ')
+        try {
+          const order = await getBackendOrder(result.order_id)
+          productNames = order.items.map((item) => item.product.title).join(', ') || productNames
+        } catch (cause) {
+          console.warn('Could not reload the captured backend order details.', cause)
+        }
         setPayment({ id: result.paypal_reference, status: result.status })
         if (result.status === 'COMPLETED') {
           const transaction: Transaction = {
             id: result.id ?? result.paypal_reference,
             orderId: result.order_id,
-            product: cart.map((item) => item.product.name).join(', '),
+            product: productNames || 'Product details unavailable',
             amount: result.amount,
             currency: result.currency,
             date: result.date,

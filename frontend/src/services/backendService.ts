@@ -1,5 +1,6 @@
 import { api } from './api'
-import { mapProduct } from './productService'
+import { DUMMYJSON_PLATFORM_ID, mapProduct } from './productService'
+import type { CartTotals } from './cartService'
 import type {
   AuditEvent,
   BackendOrder,
@@ -13,6 +14,14 @@ import type {
 
 interface BackendCart {
   items: Array<{ product: ProductApiListResponse['products'][number]; quantity: number }>
+  totals: { subtotal: number; shipping: number; tax: number; total: number; currency: 'USD' }
+}
+
+function mapBackendCart(cart: BackendCart): { items: CartItem[]; totals: CartTotals } {
+  return {
+    items: cart.items.map(({ product, quantity }) => ({ product: mapProduct(product), quantity })),
+    totals: { ...cart.totals, hasMixedCurrencies: false },
+  }
 }
 
 export interface ShoppingPlatform {
@@ -21,6 +30,8 @@ export interface ShoppingPlatform {
   supported: boolean
   demo_only: boolean
   description: string
+  connected?: boolean | null
+  status?: string | null
 }
 
 export interface DashboardSummary {
@@ -44,13 +55,17 @@ export async function getDashboardSummary(): Promise<DashboardSummary> {
   }
 }
 
-export async function getCart(): Promise<CartItem[]> {
+export async function getCart(): Promise<{ items: CartItem[]; totals: CartTotals }> {
   const response = await api.get<BackendCart>('/cart')
-  return response.data.items.map(({ product, quantity }) => ({ product: mapProduct(product), quantity }))
+  return mapBackendCart(response.data)
 }
 
 export async function addCartProduct(productId: string): Promise<void> {
-  await api.post('/cart/items', { product_id: Number(productId), quantity: 1 })
+  const numericId = Number(productId)
+  if (!Number.isSafeInteger(numericId) || numericId < 1) {
+    throw new Error('Only numeric DummyJSON products can be added to the cart.')
+  }
+  await api.post('/cart/items', { product_id: numericId, quantity: 1 })
 }
 
 export async function updateCartProduct(productId: string, quantity: number): Promise<void> {
@@ -67,24 +82,53 @@ export async function clearBackendCart(): Promise<void> {
 
 export async function getPlatforms(): Promise<ShoppingPlatform[]> {
   const response = await api.get<ShoppingPlatform[]>('/platforms')
-  return response.data
+  return response.data.map((platform) => ({
+    ...platform,
+    supported: platform.id === DUMMYJSON_PLATFORM_ID && platform.supported,
+    connected: platform.id === DUMMYJSON_PLATFORM_ID ? platform.connected : false,
+    status: platform.id === DUMMYJSON_PLATFORM_ID ? platform.status : 'NOT_CONFIGURED',
+  }))
 }
 
-export async function searchRecommendations(intent: PurchaseIntent): Promise<ProductRecommendation[]> {
+export async function searchRecommendations(intent: PurchaseIntent): Promise<{
+  recommendations: ProductRecommendation[]
+  total: number
+}> {
+  if (intent.platformId !== DUMMYJSON_PLATFORM_ID) {
+    throw new Error('Recommendations are available only for the DummyJSON Demo Store.')
+  }
   const response = await api.post<{
+    total: number
     recommendations: Array<{
       product: ProductApiListResponse['products'][number]
       analysis: ProductRecommendation['analysis']
     }>
   }>('/recommendations/search', { intent })
-  return response.data.recommendations.map(({ product, analysis }) => ({
-    product: mapProduct(product),
-    analysis,
-  }))
+  return {
+    total: response.data.total,
+    recommendations: response.data.recommendations.map(({ product, analysis }) => ({
+      product: mapProduct(product),
+      analysis,
+    })),
+  }
 }
 
 export async function createBackendOrder(intent: PurchaseIntent): Promise<BackendOrder> {
+  if (intent.platformId !== DUMMYJSON_PLATFORM_ID) {
+    throw new Error('Orders can be created only from the DummyJSON Demo Store.')
+  }
   const response = await api.post<BackendOrder>('/orders', { intent })
+  return {
+    ...response.data,
+    items: response.data.items.map(({ product, quantity }) => ({
+      product: { ...product, id: Number(product.id) },
+      quantity,
+    })),
+  }
+}
+
+export async function getBackendOrder(orderId: string): Promise<BackendOrder> {
+  const response = await api.get<BackendOrder>(`/orders/${encodeURIComponent(orderId)}`)
   return {
     ...response.data,
     items: response.data.items.map(({ product, quantity }) => ({
@@ -152,9 +196,25 @@ export async function verifyBackendAudit(): Promise<{ valid: boolean; records_ch
 
 export function getBackendError(error: unknown, fallback: string): string {
   if (typeof error === 'object' && error !== null && 'response' in error) {
-    const response = (error as { response?: { data?: { detail?: unknown } } }).response
-    if (typeof response?.data?.detail === 'string') return response.data.detail
+    const response = (error as { response?: { status?: number; data?: { detail?: unknown } } }).response
+    const detail = response?.data?.detail
+    if (typeof detail === 'string') return detail
+    if (Array.isArray(detail)) {
+      const messages = detail.map((item) => {
+        if (typeof item === 'string') return item
+        if (typeof item === 'object' && item !== null && 'msg' in item && typeof item.msg === 'string') {
+          return item.msg
+        }
+        return null
+      }).filter((message): message is string => message !== null)
+      if (messages.length) return messages.join(' ')
+    }
+    if (response?.status === 401) return 'Your session has expired. Sign in again to continue.'
+    if (response?.status === 409) return 'The order changed since it was reviewed. Refresh the cart and verify it again.'
+    if (response?.status === 503) return 'This backend service is temporarily unavailable or not configured.'
   }
-  if (error instanceof Error && error.message) return error.message
+  if (error instanceof Error && error.message && !error.message.startsWith('Request failed with status code')) {
+    return error.message
+  }
   return fallback
 }

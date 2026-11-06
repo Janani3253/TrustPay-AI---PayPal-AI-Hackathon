@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { BrowserRouter, Navigate, Outlet, Route, Routes, useLocation } from 'react-router-dom'
 import { AppProvider } from './context/AppContext'
 import { AppLayout } from './components/layout/AppLayout'
@@ -17,11 +18,13 @@ function ProtectedLayout() {
 }
 
 function RequirePlatform() {
-  const { selectedPlatformId } = useApp()
-  const location = useLocation()
-  return selectedPlatformId === 'dummyjson'
-    ? <Outlet />
-    : <Navigate to="/platforms" replace state={{ from: location }} />
+  const { selectedPlatformId, setSelectedPlatformId } = useApp()
+  useEffect(() => {
+    if (selectedPlatformId !== 'dummyjson') {
+      setSelectedPlatformId('dummyjson')
+    }
+  }, [selectedPlatformId, setSelectedPlatformId])
+  return <Outlet />
 }
 
 export default function App() {

@@ -17,14 +17,13 @@ Set `VITE_API_BASE_URL=http://localhost:8000` in `frontend\.env`. The shared Axi
 
 ## Current integrations
 
-- Login, registration, shopping intent, DummyJSON catalogue, recommendations, cart, order verification, approval, PayPal Sandbox, transactions, and audit records call the existing local FastAPI endpoints.
-- Product search uses real DummyJSON results through the current backend. Products are labelled as demo catalogue data.
-- The catalogue supports provider status display, Amazon/Flipkart/Myntra filters, provider-aware result normalization, and cross-provider product comparison. It does not mark a provider connected without a backend response.
-- The local backend implements provider status and normalized search for the DummyJSON Demo Store. Amazon, Flipkart, and Myntra remain unavailable until authorized provider adapters are implemented; adding non-demo products to the legacy cart is disabled.
-- Amazon PA-API 5 is deprecated in favor of Amazon Creators API. Flipkart API use requires approved Affiliate access. Myntra must not be enabled without official authorized catalogue/partner access. Keep all provider credentials server-side.
-- PayPal Sandbox is available only when backend credentials exist; no successful payment is fabricated.
+- Login, registration, session restoration/logout, shopping intent, DummyJSON product search, recommendations, backend-authoritative cart totals, order verification, approval, PayPal Sandbox, transactions, and audit records use the existing FastAPI endpoints.
+- Product and category requests use the canonical `platform=dummyjson` query parameter and honor backend pagination.
+- DummyJSON is the only supported shopping platform. Amazon, Flipkart, and Myntra are unavailable; the frontend does not show them as connected or substitute Demo products for their unavailable catalogues.
+- Verification and approval are session-only frontend state backed by server checks; a refresh clears those indicators and requires verification and approval again.
+- PayPal Sandbox is available only when backend credentials exist; successful payment is shown only after backend-confirmed capture.
 
-See [`API_INTEGRATION.md`](./API_INTEGRATION.md) for implemented routes, proposed routes, payloads, response shapes, and backend contract mismatches.
+See [`API_INTEGRATION.md`](./API_INTEGRATION.md) for the routes, payloads, and response shapes used by the frontend.
 
 ## Quality checks
 
@@ -36,7 +35,6 @@ npm run build
 ## Project layout
 
 - `src/pages/` — landing, auth, dashboard, product, request, order, verification, payment, transaction, and audit pages.
-- `src/components/marketplace/` — provider status, common marketplace product cards, catalogue, and comparison.
 - `src/context/` — authentication and shared shopping state.
-- `src/services/` — Axios client and typed API adapters, including marketplace provider normalization.
+- `src/services/` — Axios client and typed API adapters.
 - `src/types/` — API and application data types.
