@@ -61,10 +61,6 @@ export async function removeCartProduct(productId: string): Promise<void> {
   await api.delete(`/cart/items/${encodeURIComponent(productId)}`)
 }
 
-export async function clearBackendCart(): Promise<void> {
-  await api.delete('/cart/items')
-}
-
 export async function getPlatforms(): Promise<ShoppingPlatform[]> {
   const response = await api.get<ShoppingPlatform[]>('/platforms')
   return response.data
@@ -103,22 +99,49 @@ export async function approveBackendOrder(orderId: string, orderVersion: number)
   await api.post(`/approvals/${encodeURIComponent(orderId)}/approve`, { order_version: orderVersion })
 }
 
-export async function createPayPalOrder(orderId: string): Promise<{ approval_url: string }> {
-  const response = await api.post<{ approval_url: string }>('/payments/create-order', { order_id: orderId })
+export async function createPayPalOrder(orderId: string): Promise<{
+  order_id: string
+  paypal_order_id: string
+  approval_url: string
+  status: string
+}> {
+  const response = await api.post<{
+    order_id: string
+    paypal_order_id: string
+    approval_url: string
+    status: string
+  }>('/payments/create-order', { order_id: orderId }, { timeout: 120000 })
   return response.data
 }
 
-export async function capturePayPalOrder(paypalOrderId: string): Promise<{
+export interface BackendPaymentResult {
   id: string | null
   order_id: string
-  paypal_reference: string
+  paypal_reference: string | null
   amount: number
   currency: 'USD' | 'INR'
   date: string
   status: string
   method: string
-}> {
-  const response = await api.post('/payments/capture-order', { paypal_order_id: paypalOrderId })
+  product?: string
+  cart_cleared?: boolean
+}
+
+export async function capturePayPalOrder(paypalOrderId: string): Promise<BackendPaymentResult> {
+  const response = await api.post<BackendPaymentResult>(
+    '/payments/capture-order',
+    { paypal_order_id: paypalOrderId },
+    { timeout: 120000 },
+  )
+  return response.data
+}
+
+export async function cancelPayPalOrder(orderId: string): Promise<BackendPaymentResult> {
+  const response = await api.post<BackendPaymentResult>(
+    '/payments/cancel-order',
+    { order_id: orderId },
+    { timeout: 120000 },
+  )
   return response.data
 }
 

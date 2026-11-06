@@ -16,11 +16,11 @@ import { getProduct, getProductCategories, getProducts, mapProduct, productDataS
 import { calculateCartTotals } from '../services/cartService'
 import { getOrderFingerprint } from '../utils/order'
 import {
-  addCartProduct, approveBackendOrder, clearBackendCart, createBackendOrder,
-  createPayPalOrder, capturePayPalOrder, getAuditEvents, getBackendError,
+  addCartProduct, approveBackendOrder, createBackendOrder,
+  createPayPalOrder, capturePayPalOrder, cancelPayPalOrder, getAuditEvents, getBackendError,
   getDashboardSummary, getPlatforms, removeCartProduct, searchRecommendations,
   updateCartProduct, verifyBackendAudit, verifyBackendOrder,
-  type ShoppingPlatform,
+  type BackendPaymentResult, type ShoppingPlatform,
 } from '../services/backendService'
 import type { AuditEvent, BackendVerificationCheck, Currency, Product, ProductCategory, ProductRecommendation, Transaction } from '../types'
 
@@ -423,8 +423,14 @@ export function ApprovalPage() {
 export function PaymentPage() {
   const { cart, intent, backendOrder, backendVerification, approved, verified, verifiedFingerprint, addTransaction, clearCart, notify } = useApp()
   const [searchParams] = useSearchParams()
-  const [processing, setProcessing] = useState(() => Boolean(searchParams.get('token')))
-  const [payment, setPayment] = useState<{ id: string; status: string } | null>(null)
+  const [processing, setProcessing] = useState(() => Boolean(
+    searchParams.get('token') || searchParams.get('cancelled') === '1',
+  ))
+  const [payment, setPayment] = useState<{
+    id: string | null
+    status: string
+    paypalOrderId: string | null
+  } | null>(null)
   const [paymentError, setPaymentError] = useState('')
   const returnHandled = useRef(false)
   const totals = calculateCartTotals(cart)
@@ -436,39 +442,62 @@ export function PaymentPage() {
     && approved && verified && snapshotMatches,
   )
 
+  const handlePaymentResult = useCallback(async (
+    result: BackendPaymentResult,
+    paypalOrderId: string | null,
+  ) => {
+    setPayment({
+      id: result.paypal_reference ?? result.id,
+      status: result.status,
+      paypalOrderId,
+    })
+    if (result.status === 'COMPLETED') {
+      const transaction: Transaction = {
+        id: result.id ?? result.paypal_reference ?? result.order_id,
+        orderId: result.order_id,
+        product: result.product || cart.map((item) => item.product.name).join(', ') || 'TrustPay order',
+        amount: result.amount,
+        currency: result.currency,
+        date: result.date,
+        method: result.method,
+        status: 'Completed',
+        verification: 'Backend verified',
+      }
+      addTransaction(transaction)
+      if (result.cart_cleared) clearCart()
+      notify(
+        result.cart_cleared
+          ? 'Sandbox payment completed and transaction recorded.'
+          : 'Sandbox payment completed. Your current cart was preserved.',
+        result.cart_cleared ? 'success' : 'info',
+      )
+    } else if (result.status === 'CANCELLED') {
+      notify('PayPal Sandbox checkout was cancelled; no payment was captured.', 'info')
+    } else {
+      notify('PayPal has not confirmed completion. Check the payment status before retrying.', 'info')
+    }
+  }, [addTransaction, cart, clearCart, notify])
+  const paymentResultHandler = useRef(handlePaymentResult)
+  paymentResultHandler.current = handlePaymentResult
+
   useEffect(() => {
     if (returnHandled.current) return
     const paypalOrderId = searchParams.get('token')
-    if (searchParams.get('cancelled') === '1') {
-      returnHandled.current = true
-      return
-    }
-    if (!paypalOrderId) return
+    const cancelled = searchParams.get('cancelled') === '1'
+    const trustPayOrderId = searchParams.get('order_id')
+    if (!paypalOrderId && !cancelled) return
     returnHandled.current = true
     let active = true
-    capturePayPalOrder(paypalOrderId)
+    const request = cancelled
+      ? trustPayOrderId
+        ? cancelPayPalOrder(trustPayOrderId)
+        : Promise.reject(new Error('PayPal return is missing its TrustPay order reference.'))
+      : paypalOrderId
+        ? capturePayPalOrder(paypalOrderId)
+        : Promise.reject(new Error('PayPal return is missing its order reference.'))
+    request
       .then(async (result) => {
-        if (!active) return
-        setPayment({ id: result.paypal_reference, status: result.status })
-        if (result.status === 'COMPLETED') {
-          const transaction: Transaction = {
-            id: result.id ?? result.paypal_reference,
-            orderId: result.order_id,
-            product: cart.map((item) => item.product.name).join(', '),
-            amount: result.amount,
-            currency: result.currency,
-            date: result.date,
-            method: result.method,
-            status: 'Completed',
-            verification: 'Backend verified',
-          }
-          addTransaction(transaction)
-          await clearBackendCart()
-          clearCart()
-          notify('Sandbox payment completed and transaction recorded.')
-        } else if (result.status === 'CANCELLED') {
-          notify('PayPal Sandbox checkout was cancelled; no payment was captured.', 'info')
-        }
+        if (active) await paymentResultHandler.current(result, paypalOrderId)
       })
       .catch((cause: unknown) => {
         if (active) {
@@ -479,10 +508,32 @@ export function PaymentPage() {
       })
       .finally(() => { if (active) setProcessing(false) })
     return () => { active = false }
-  }, [searchParams, addTransaction, cart, clearCart, notify])
-  const paymentResult = payment ?? (searchParams.get('cancelled') === '1'
-    ? { id: searchParams.get('order_id') ?? '', status: 'CANCELLED' }
-    : null)
+  }, [searchParams])
+
+  const retryPaymentStatus = async () => {
+    if (processing) return
+    setProcessing(true)
+    setPaymentError('')
+    const paypalOrderId = payment?.paypalOrderId ?? searchParams.get('token')
+    const trustPayOrderId = searchParams.get('order_id')
+    try {
+      const result = searchParams.get('cancelled') === '1' && trustPayOrderId
+        ? await cancelPayPalOrder(trustPayOrderId)
+        : paypalOrderId
+          ? await capturePayPalOrder(paypalOrderId)
+          : null
+      if (!result) {
+        throw new Error('Payment return is missing its order reference.')
+      }
+      await paymentResultHandler.current(result, paypalOrderId)
+    } catch (cause) {
+      const message = getBackendError(cause, 'PayPal Sandbox could not confirm the payment result.')
+      setPaymentError(message)
+      notify(message, 'error')
+    } finally {
+      setProcessing(false)
+    }
+  }
 
   const pay = async () => {
     if (!paymentAllowed || processing || !backendOrder) return
@@ -498,11 +549,33 @@ export function PaymentPage() {
       setProcessing(false)
     } finally { setProcessing(false) }
   }
-  if (processing && !paymentResult && !paymentError) return <div className="panel api-state"><span className="spinner" /><p>Waiting for PayPal Sandbox confirmation…</p></div>
-  if (paymentResult) {
-    const completed = paymentResult.status === 'COMPLETED'
-    const cancelled = paymentResult.status === 'CANCELLED'
-    return <div className="panel payment-result"><div className={`result-icon ${completed ? 'success' : 'failure'}`}>{completed ? <CheckCircle2 size={34} /> : <CircleAlert size={34} />}</div><span className="eyebrow">PAYPAL SANDBOX · LIVE PROVIDER RESPONSE</span><h1>{completed ? 'Sandbox payment completed' : cancelled ? 'Payment cancelled' : `Payment ${paymentResult.status.toLowerCase()}`}</h1><p>{completed ? 'PayPal confirmed the capture. The backend recorded the transaction.' : cancelled ? 'The PayPal checkout was cancelled; no payment was captured.' : 'PayPal did not confirm a completed capture. No successful payment is recorded.'}</p>{paymentResult.id && <div className="transaction-id"><small>PAYPAL REFERENCE</small><b>{paymentResult.id}</b></div>}<ButtonLink to="/transactions" icon={<ArrowRight size={16} />}>View transaction history</ButtonLink></div>
+  if (processing && !payment && !paymentError) return <div className="panel api-state"><span className="spinner" /><p>Checking PayPal Sandbox with the backend…</p></div>
+  if (payment) {
+    const completed = payment.status === 'COMPLETED'
+    const cancelled = payment.status === 'CANCELLED'
+    const pending = payment.status === 'PENDING'
+    const canRetry = pending || (Boolean(paymentError) && !completed && !cancelled)
+    return <div className="panel payment-result">
+      <div className={`result-icon ${completed ? 'success' : 'failure'}`}>{completed ? <CheckCircle2 size={34} /> : <CircleAlert size={34} />}</div>
+      <span className="eyebrow">PAYPAL SANDBOX · BACKEND VERIFIED STATUS</span>
+      <h1>{completed ? 'Sandbox payment completed' : cancelled ? 'Payment cancelled' : pending ? 'Payment pending confirmation' : `Payment ${payment.status.toLowerCase()}`}</h1>
+      <p>{completed ? 'PayPal confirmed the capture. The backend recorded the transaction.' : cancelled ? 'The PayPal checkout was cancelled; no payment was captured.' : 'PayPal has not confirmed completion. No successful payment is recorded yet.'}</p>
+      {paymentError && <div className="form-error">{paymentError}</div>}
+      {payment.id && <div className="transaction-id"><small>PAYPAL REFERENCE</small><b>{payment.id}</b></div>}
+      {canRetry && <button className="btn btn-primary" onClick={() => void retryPaymentStatus()} disabled={processing}>{processing ? 'Checking status…' : 'Check payment status'}</button>}
+      <ButtonLink to="/transactions" icon={<ArrowRight size={16} />}>View transaction history</ButtonLink>
+    </div>
+  }
+  if (paymentError && !payment && (searchParams.get('token') || searchParams.get('cancelled') === '1')) {
+    return <div className="panel payment-result">
+      <div className="result-icon failure"><CircleAlert size={34} /></div>
+      <span className="eyebrow">PAYPAL SANDBOX · STATUS NOT CONFIRMED</span>
+      <h1>Payment status needs checking</h1>
+      <p>{paymentError}</p>
+      <button className="btn btn-primary" onClick={() => void retryPaymentStatus()} disabled={processing}>
+        {processing ? 'Checking status…' : 'Check payment status'}
+      </button>
+    </div>
   }
   return <><PageTitle eyebrow="SECURE CHECKOUT" title="PayPal Sandbox Checkout" description="Checkout is created and captured by the backend using server-only sandbox credentials." />{paymentError && <div className="form-error">{paymentError}</div>}<div className="payment-layout"><section className="panel payment-main"><div className="paypal-brand"><span className="paypal-mark">P</span><b>PayPal</b><span className="sandbox-badge">SANDBOX TEST PAYMENT</span></div>{!paymentAllowed && <div className="info-banner warning-banner"><CircleAlert size={18} /><span>Payment is blocked until backend verification and explicit approval are current.</span><Link to={cart.length ? '/approval' : '/cart'}>{cart.length ? 'Review approval' : 'Build an order'}</Link></div>}<div className="payment-protection"><ShieldCheck size={19} /><div><b>Backend order state</b><small>Verification: {verified && snapshotMatches ? 'Current snapshot verified' : 'Not verified'} · Approval: {approved && snapshotMatches ? 'Approved' : 'Not approved'}</small></div>{paymentAllowed ? <CheckCircle2 size={18} /> : <CircleAlert size={18} />}</div><div className="payment-order-title"><h2>Verified order amount</h2><span>{cart.length} item{cart.length === 1 ? '' : 's'}</span></div>{cart.length ? cart.map(({ product, quantity }) => <div className="payment-item" key={product.id}><img src={product.image} alt={product.name} /><div><b>{product.name}</b><small>Qty {quantity} · Seller not verified by catalogue</small></div><strong>{formatMoney(product.price * quantity, product.currency)}</strong></div>) : <div className="empty-message">No order is ready for payment.</div>}<div className="summary-row total-row"><b>Total due</b><strong>{display(backendVerification?.totals.total ?? totals.total)}</strong></div><button className="paypal-button" onClick={() => void pay()} disabled={!paymentAllowed || processing}>{processing ? <><span className="spinner" /> Connecting to PayPal Sandbox…</> : <><span>Continue to</span> <b>PayPal</b> <ArrowRight size={16} /></>}</button><p className="sandbox-disclaimer">Sandbox only · Provider approval and capture are handled by the backend · No card data stored here</p></section><aside className="payment-aside"><div className="aside-icon"><LockKeyhole size={20} /></div><h3>Pre-payment recheck</h3><p>The backend rejects checkout if the approved order snapshot or cart has changed.</p><div className="payment-assurances"><span><CheckCircle2 size={15} /> Exact order approved: {approved && snapshotMatches ? 'Yes' : 'No'}</span><span><CheckCircle2 size={15} /> Server verification passed: {backendVerification?.status === 'Passed' ? 'Yes' : 'No'}</span><span><CheckCircle2 size={15} /> Sandbox transaction only</span></div></aside></div></>
 }

@@ -58,6 +58,20 @@ function getStored<T>(key: string, fallback: T): T {
   }
 }
 
+function getSanitizedErrorMessage(error: unknown): string {
+  if (typeof error === 'object' && error !== null && 'response' in error) {
+    const response = error.response
+    if (typeof response === 'object' && response !== null && 'status' in response) {
+      const responseStatus = response.status
+      if (typeof responseStatus === 'number' && Number.isInteger(responseStatus)
+        && responseStatus >= 100 && responseStatus <= 599) {
+        return `Request failed with HTTP ${responseStatus}.`
+      }
+    }
+  }
+  return 'Request failed; details omitted.'
+}
+
 function getStoredCart(): CartItem[] {
   const stored = getStored<unknown>('trustpay-cart', [])
   if (!Array.isArray(stored)) {
@@ -122,7 +136,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     getCurrentUser()
       .then((currentUser) => { if (active) setUser(currentUser) })
       .catch((error: unknown) => {
-        console.error('Could not restore the backend session.', error)
+        console.error('Could not restore the backend session.', getSanitizedErrorMessage(error))
         if (active) {
           clearAuthToken()
           setUser(null)
@@ -142,7 +156,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
           setTransactions(remoteTransactions)
         }
       })
-      .catch((error: unknown) => console.error('Could not synchronize shopping data with the backend.', error))
+      .catch((error: unknown) => console.error(
+        'Could not synchronize shopping data with the backend.',
+        getSanitizedErrorMessage(error),
+      ))
     return () => { active = false }
   }, [user])
 
@@ -265,7 +282,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
     recordAudit,
     notify,
     dismissToast,
-    addTransaction: (transaction) => setTransactions((current) => [transaction, ...current]),
+    addTransaction: (transaction) => setTransactions((current) => [
+      transaction,
+      ...current.filter((existing) => existing.id !== transaction.id && existing.orderId !== transaction.orderId),
+    ]),
     clearCart: () => {
       setCart([])
       setApprovalFingerprint(null)

@@ -9,9 +9,10 @@ import secrets
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -37,6 +38,20 @@ from .schemas import (
 
 DUMMYJSON_BASE_URL = os.getenv("DUMMYJSON_BASE_URL", "https://dummyjson.com").rstrip("/")
 PAYPAL_API_BASE_URL = os.getenv("PAYPAL_API_BASE_URL", "https://api-m.sandbox.paypal.com").rstrip("/")
+_paypal_api_url = urlparse(PAYPAL_API_BASE_URL)
+if (
+    _paypal_api_url.scheme != "https"
+    or _paypal_api_url.hostname != "api-m.sandbox.paypal.com"
+    or _paypal_api_url.port not in (None, 443)
+    or _paypal_api_url.username is not None
+    or _paypal_api_url.password is not None
+    or _paypal_api_url.path not in ("", "/")
+    or _paypal_api_url.query
+    or _paypal_api_url.fragment
+):
+    raise RuntimeError(
+        "PAYPAL_API_BASE_URL must be https://api-m.sandbox.paypal.com; live PayPal is not supported."
+    )
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173").rstrip("/")
 SECRET_KEY = os.getenv("TRUSTPAY_SECRET_KEY", "local-development-key-change-before-deployment")
 TOKEN_TTL_SECONDS = 60 * 60 * 8
@@ -138,23 +153,36 @@ def get_current_user(authorization: str | None = Header(default=None)) -> dict[s
     return dict(user)
 
 
-def add_audit(user_id: int, event_type: str, description: str) -> None:
+def add_audit(
+    user_id: int,
+    event_type: str,
+    description: str,
+    connection: sqlite3.Connection | None = None,
+) -> None:
     event_id = str(uuid.uuid4())
     timestamp = utc_now()
-    with connect() as connection:
-        previous = connection.execute(
+
+    def insert_event(db: sqlite3.Connection) -> None:
+        previous = db.execute(
             "SELECT hash FROM audit_events WHERE user_id = ? ORDER BY rowid DESC LIMIT 1",
             (user_id,),
         ).fetchone()
         previous_hash = previous["hash"] if previous else "GENESIS"
         payload = {"id": event_id, "type": event_type, "timestamp": timestamp, "description": description}
         digest = hashlib.sha256(f"{previous_hash}:{json_dump(payload)}".encode()).hexdigest()
-        connection.execute(
+        db.execute(
             """INSERT INTO audit_events
                (id, user_id, type, timestamp, description, previous_hash, hash)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (event_id, user_id, event_type, timestamp, description, previous_hash, digest),
         )
+
+    if connection is not None:
+        insert_event(connection)
+        return
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        insert_event(db)
 
 
 async def dummyjson_get(path: str, params: dict[str, Any] | None = None) -> Any:
@@ -347,7 +375,7 @@ def order_matches_cart(order: Any, items: list[dict[str, Any]]) -> bool:
 async def paypal_access_token() -> str:
     client_id = os.getenv("PAYPAL_CLIENT_ID", "")
     client_secret = os.getenv("PAYPAL_CLIENT_SECRET", "")
-    if not client_id or not client_secret:
+    if not client_id.strip() or not client_secret.strip():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="PayPal Sandbox is not configured. Set PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET on the backend.",
@@ -360,10 +388,561 @@ async def paypal_access_token() -> str:
                 data={"grant_type": "client_credentials"},
                 headers={"Accept": "application/json"},
             )
-            response.raise_for_status()
-            return response.json()["access_token"]
-    except (httpx.HTTPError, KeyError, ValueError) as error:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not authenticate with PayPal Sandbox.") from error
+    except httpx.HTTPError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not connect to PayPal Sandbox authentication.",
+        ) from error
+
+    if response.status_code == status.HTTP_401_UNAUTHORIZED:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal Sandbox rejected the backend credentials.",
+        )
+    if not response.is_success:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not authenticate with PayPal Sandbox.",
+        )
+    try:
+        token_response = response.json()
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal Sandbox returned an invalid authentication response.",
+        ) from error
+    access_token = token_response.get("access_token") if isinstance(token_response, dict) else None
+    if not isinstance(access_token, str) or not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal Sandbox returned an invalid authentication response.",
+        )
+    return access_token
+
+
+class PayPalTransportError(Exception):
+    pass
+
+
+async def paypal_api_request(
+    method: str,
+    path: str,
+    *,
+    payload: dict[str, Any] | None = None,
+    request_id: str | None = None,
+    access_token: str | None = None,
+) -> tuple[int, dict[str, Any]]:
+    token = access_token or await paypal_access_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if request_id:
+        headers["PayPal-Request-Id"] = request_id
+
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=25) as client:
+                response = await client.request(
+                    method,
+                    f"{PAYPAL_API_BASE_URL}{path}",
+                    headers=headers,
+                    json=payload,
+                )
+        except httpx.HTTPError as error:
+            raise PayPalTransportError from error
+
+        if response.status_code == status.HTTP_401_UNAUTHORIZED and attempt == 0:
+            token = await paypal_access_token()
+            headers["Authorization"] = f"Bearer {token}"
+            continue
+
+        try:
+            body = response.json()
+        except ValueError as error:
+            if response.is_success:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="PayPal Sandbox returned an invalid response.",
+                ) from error
+            body = {}
+        if not isinstance(body, dict):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="PayPal Sandbox returned an invalid response.",
+            )
+        return response.status_code, body
+
+    raise PayPalTransportError("PayPal authentication could not be refreshed.")
+
+
+def payment_request_id(action: str, order_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"trustpay:{action}:{order_id}"))
+
+
+def validate_paypal_purchase_unit(
+    paypal_order: dict[str, Any],
+    order: Any,
+    paypal_order_id: str | None = None,
+) -> dict[str, Any]:
+    if paypal_order_id is not None and paypal_order.get("id") != paypal_order_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="PayPal returned a different order than the one approved.",
+        )
+    purchase_units = paypal_order.get("purchase_units")
+    if not isinstance(purchase_units, list) or len(purchase_units) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal returned an unexpected number of purchase units.",
+        )
+    purchase_unit = purchase_units[0]
+    if not isinstance(purchase_unit, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal returned an invalid purchase unit.",
+        )
+    if purchase_unit.get("reference_id") != order["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="PayPal purchase reference does not match the approved TrustPay order.",
+        )
+
+    amount = purchase_unit.get("amount")
+    if not isinstance(amount, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal returned an invalid order amount.",
+        )
+    try:
+        expected_amount = Decimal(str(order["total"])).quantize(Decimal("0.01"))
+        actual_amount = Decimal(str(amount.get("value", "")))
+    except (InvalidOperation, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal returned an invalid order amount.",
+        )
+    if not actual_amount.is_finite() or actual_amount != expected_amount:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="PayPal order amount does not match the approved TrustPay order.",
+        )
+    if amount.get("currency_code") != order["currency"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="PayPal order currency does not match the approved TrustPay order.",
+        )
+    return purchase_unit
+
+
+def paypal_create_response_needs_refresh(paypal_order: dict[str, Any]) -> bool:
+    purchase_units = paypal_order.get("purchase_units")
+    if not isinstance(purchase_units, list) or not purchase_units:
+        return True
+    if len(purchase_units) != 1 or not isinstance(purchase_units[0], dict):
+        return False
+
+    purchase_unit = purchase_units[0]
+    amount = purchase_unit.get("amount")
+    if (
+        "reference_id" not in purchase_unit
+        or not isinstance(amount, dict)
+        or "value" not in amount
+        or "currency_code" not in amount
+    ):
+        return True
+
+    links = paypal_order.get("links")
+    has_approval_link = isinstance(links, list) and any(
+        isinstance(link, dict)
+        and link.get("rel") in {"approve", "payer-action"}
+        and isinstance(link.get("href"), str)
+        and link["href"]
+        for link in links
+    )
+    return paypal_order.get("status") is None or not has_approval_link
+
+
+def paypal_approval_url(paypal_order: dict[str, Any]) -> str:
+    links = paypal_order.get("links")
+    if not isinstance(links, list):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal Sandbox did not return an approval URL.",
+        )
+    approval_url = next(
+        (
+            link.get("href")
+            for link in links
+            if isinstance(link, dict) and link.get("rel") in {"approve", "payer-action"}
+        ),
+        None,
+    )
+    try:
+        parsed_url = urlparse(approval_url) if isinstance(approval_url, str) else None
+        allowed_port = parsed_url is not None and parsed_url.port in (None, 443)
+    except ValueError:
+        parsed_url = None
+        allowed_port = False
+    if (
+        parsed_url is None
+        or parsed_url.scheme != "https"
+        or not allowed_port
+        or parsed_url.hostname is None
+        or not (
+            parsed_url.hostname == "sandbox.paypal.com"
+            or parsed_url.hostname.endswith(".sandbox.paypal.com")
+        )
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal Sandbox returned an invalid approval URL.",
+        )
+    return approval_url
+
+
+def validate_paypal_capture(
+    paypal_order: dict[str, Any],
+    order: Any,
+    paypal_order_id: str,
+) -> tuple[str, Decimal, str]:
+    if paypal_order.get("id") != paypal_order_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="PayPal returned a different order than the one approved.",
+        )
+    if paypal_order.get("status") != "COMPLETED":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="PayPal has not confirmed a completed payment.",
+        )
+    purchase_unit = validate_paypal_purchase_unit(paypal_order, order)
+    payments = purchase_unit.get("payments")
+    captures = payments.get("captures") if isinstance(payments, dict) else None
+    if not isinstance(captures, list) or len(captures) != 1 or not isinstance(captures[0], dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal did not return exactly one payment capture.",
+        )
+
+    capture = captures[0]
+    capture_id = capture.get("id")
+    if capture.get("status") != "COMPLETED" or not isinstance(capture_id, str) or not capture_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="PayPal did not confirm a completed capture.",
+        )
+    if capture.get("final_capture") is False:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="PayPal returned a partial capture for the approved order.",
+        )
+    capture_amount = capture.get("amount")
+    if not isinstance(capture_amount, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal returned an invalid capture amount.",
+        )
+    try:
+        expected_amount = Decimal(str(order["total"])).quantize(Decimal("0.01"))
+        actual_amount = Decimal(str(capture_amount.get("value", "")))
+    except (InvalidOperation, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal returned an invalid capture amount.",
+        )
+    currency = capture_amount.get("currency_code")
+    if not actual_amount.is_finite() or actual_amount != expected_amount:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Captured amount does not match the customer-approved order amount.",
+        )
+    if currency != order["currency"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Captured currency does not match the customer-approved order currency.",
+        )
+    return capture_id, actual_amount, currency
+
+
+def payment_pending_response(order: Any) -> dict[str, Any]:
+    return {
+        "id": None,
+        "order_id": order["id"],
+        "paypal_reference": None,
+        "amount": order["total"],
+        "currency": order["currency"],
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "status": "PENDING",
+        "method": "PayPal Sandbox",
+    }
+
+
+def set_payment_status(order_id: str, user_id: int, next_status: str) -> None:
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        order = require_order(connection, order_id, user_id)
+        if order["status"] != "completed":
+            connection.execute(
+                "UPDATE orders SET status = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+                (next_status, utc_now(), order_id, user_id),
+            )
+
+
+def audit_paypal_validation_error(user_id: int, order_id: str, error: HTTPException) -> None:
+    detail = error.detail.lower() if isinstance(error.detail, str) else ""
+    if "currency" in detail:
+        event_type = "Payment currency mismatch detected"
+    elif "amount" in detail:
+        event_type = "Payment amount mismatch detected"
+    else:
+        event_type = "Payment reconciliation required"
+    add_audit(
+        user_id,
+        event_type,
+        f"PayPal response validation failed for TrustPay order {order_id}.",
+    )
+
+
+def clear_cart_if_matches_order(connection: sqlite3.Connection, order: Any) -> bool:
+    stored_items = json.loads(order["cart_json"])
+    expected = sorted(
+        (int(item["product"]["id"]), int(item["quantity"]))
+        for item in stored_items
+    )
+    if not expected:
+        return False
+    current = sorted(
+        (int(row["product_id"]), int(row["quantity"]))
+        for row in connection.execute(
+            "SELECT product_id, quantity FROM cart_items WHERE user_id = ?",
+            (order["user_id"],),
+        )
+    )
+    if current != expected:
+        return False
+    connection.execute("DELETE FROM cart_items WHERE user_id = ?", (order["user_id"],))
+    return True
+
+
+def record_completed_payment(
+    order: Any,
+    user_id: int,
+    paypal_order_id: str,
+    capture_id: str,
+    amount: Decimal,
+    currency: str,
+) -> dict[str, Any]:
+    transaction_date = datetime.now(timezone.utc).date().isoformat()
+    transaction_id = f"TRX-{uuid.uuid4().hex[:12].upper()}"
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        latest_order = require_order(connection, order["id"], user_id)
+        if latest_order["paypal_order_id"] != paypal_order_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="PayPal order no longer matches the TrustPay order.",
+            )
+        existing = connection.execute(
+            "SELECT * FROM transactions WHERE order_id = ? AND user_id = ?",
+            (order["id"], user_id),
+        ).fetchone()
+        if existing:
+            if (
+                latest_order["status"] != "completed"
+                or existing["paypal_reference"] != capture_id
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="A different payment is already recorded for this TrustPay order.",
+                )
+            return {
+                "id": existing["id"],
+                "order_id": existing["order_id"],
+                "paypal_reference": existing["paypal_reference"],
+                "amount": existing["amount"],
+                "currency": existing["currency"],
+                "date": existing["date"],
+                "status": "COMPLETED",
+                "method": existing["method"],
+                "product": existing["product"],
+                "cart_cleared": False,
+            }
+        if latest_order["status"] not in {
+            "paypal_capturing",
+            "paypal_reconciling",
+            "reconciliation_required",
+            "paypal_pending",
+            "cancelled",
+        }:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="TrustPay order is not eligible for payment completion.",
+            )
+
+        stored_items = json.loads(latest_order["cart_json"])
+        product_names = ", ".join(
+            item["product"].get("title", "Product") for item in stored_items
+        )
+        connection.execute(
+            """
+            INSERT INTO transactions
+            (id, user_id, order_id, product, amount, currency, date, method, status, verification, paypal_reference)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transaction_id,
+                user_id,
+                order["id"],
+                product_names,
+                float(amount),
+                currency,
+                transaction_date,
+                "PayPal Sandbox",
+                "Completed",
+                "Backend verified",
+                capture_id,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE orders
+            SET status = 'completed', paypal_capture_id = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (capture_id, utc_now(), order["id"], user_id),
+        )
+        cart_cleared = clear_cart_if_matches_order(connection, latest_order)
+
+    add_audit(
+        user_id,
+        "Sandbox payment completed",
+        f"PayPal Sandbox capture verified for order {order['id']}.",
+    )
+    return {
+        "id": transaction_id,
+        "order_id": order["id"],
+        "paypal_reference": capture_id,
+        "amount": float(amount),
+        "currency": currency,
+        "date": transaction_date,
+        "status": "COMPLETED",
+        "method": "PayPal Sandbox",
+        "product": product_names,
+        "cart_cleared": cart_cleared,
+    }
+
+
+async def reconcile_paypal_order(
+    order: Any,
+    user_id: int,
+    paypal_order_id: str,
+    access_token: str,
+    *,
+    cancel_if_unpaid: bool = False,
+) -> dict[str, Any]:
+    try:
+        response_status, paypal_order = await paypal_api_request(
+            "GET",
+            f"/v2/checkout/orders/{quote(paypal_order_id, safe='')}",
+            access_token=access_token,
+        )
+    except (PayPalTransportError, HTTPException) as error:
+        set_payment_status(order["id"], user_id, "reconciliation_required")
+        add_audit(
+            user_id,
+            "Payment reconciliation required",
+            f"PayPal status could not be confirmed for TrustPay order {order['id']}.",
+        )
+        return payment_pending_response(order)
+
+    if response_status != status.HTTP_200_OK:
+        set_payment_status(order["id"], user_id, "reconciliation_required")
+        add_audit(
+            user_id,
+            "Payment reconciliation required",
+            f"PayPal status could not be confirmed for TrustPay order {order['id']}.",
+        )
+        return payment_pending_response(order)
+
+    paypal_status = paypal_order.get("status")
+    if paypal_status == "COMPLETED":
+        try:
+            capture_id, amount, currency = validate_paypal_capture(
+                paypal_order,
+                order,
+                paypal_order_id,
+            )
+        except HTTPException as error:
+            set_payment_status(order["id"], user_id, "reconciliation_required")
+            audit_paypal_validation_error(user_id, order["id"], error)
+            raise
+        return record_completed_payment(
+            order,
+            user_id,
+            paypal_order_id,
+            capture_id,
+            amount,
+            currency,
+        )
+
+    if paypal_status in {"VOIDED", "CANCELLED"}:
+        set_payment_status(order["id"], user_id, "cancelled")
+        add_audit(
+            user_id,
+            "Sandbox payment cancelled",
+            f"PayPal reported a cancelled order for TrustPay order {order['id']}.",
+        )
+        response = payment_pending_response(order)
+        response["status"] = "CANCELLED"
+        return response
+
+    purchase_units = paypal_order.get("purchase_units")
+    if isinstance(purchase_units, list):
+        failed_capture = any(
+            capture.get("status") in {"DECLINED", "FAILED"}
+            for unit in purchase_units
+            if isinstance(unit, dict)
+            and isinstance(unit.get("payments"), dict)
+            and isinstance(unit["payments"].get("captures"), list)
+            for capture in unit["payments"]["captures"]
+            if isinstance(capture, dict)
+        )
+        if failed_capture or paypal_status == "DENIED":
+            set_payment_status(order["id"], user_id, "failed")
+            add_audit(
+                user_id,
+                "Sandbox payment failed",
+                f"PayPal reported a failed payment for TrustPay order {order['id']}.",
+            )
+            response = payment_pending_response(order)
+            response["status"] = "FAILED"
+            return response
+
+    if paypal_status in {"APPROVED", "CREATED"} and cancel_if_unpaid:
+        set_payment_status(order["id"], user_id, "cancelled")
+        add_audit(
+            user_id,
+            "Sandbox payment cancelled",
+            f"Customer cancelled TrustPay order {order['id']} before capture.",
+        )
+        response = payment_pending_response(order)
+        response["status"] = "CANCELLED"
+        return response
+
+    if paypal_status == "APPROVED":
+        set_payment_status(order["id"], user_id, "paypal_pending")
+    else:
+        set_payment_status(order["id"], user_id, "reconciliation_required")
+        add_audit(
+            user_id,
+            "Payment reconciliation required",
+            f"PayPal returned an unconfirmed status for TrustPay order {order['id']}.",
+        )
+    return payment_pending_response(order)
 
 
 @app.get("/health")
@@ -622,9 +1201,9 @@ async def verify_order(
     payload: VerifyOrderRequest,
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
+    items = await current_cart(user["id"])
     with connect() as connection:
         order = require_order(connection, payload.order_id, user["id"])
-        items = await current_cart(user["id"])
         if not order_matches_cart(order, items):
             checks = {
                 "status": "Failed",
@@ -676,48 +1255,302 @@ async def create_payment_order(
 ) -> dict[str, Any]:
     items = await current_cart(user["id"])
     with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         order = require_order(connection, payload.order_id, user["id"])
-        if order["status"] != "approved" or not order_matches_cart(order, items):
+        if not order_matches_cart(order, items):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Approved order is stale; reverify and approve the current cart.")
         verification = json.loads(order["checks_json"] or "{}")
         if verification.get("status") != "Passed":
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Backend verification must pass before payment.")
-    token = await paypal_access_token()
-    amount = f"{float(order['total']):.2f}"
+        if order["status"] in {"paypal_pending", "reconciliation_required"} and order["paypal_order_id"]:
+            existing_paypal_order_id = order["paypal_order_id"]
+            existing_approval_url = order["paypal_approval_url"]
+            create_request_id = order["paypal_create_request_id"]
+        elif order["status"] in {"approved", "paypal_creating"} or (
+            order["status"] == "reconciliation_required"
+            and not order["paypal_order_id"]
+            and order["paypal_create_request_id"]
+        ):
+            existing_paypal_order_id = None
+            existing_approval_url = None
+            create_request_id = order["paypal_create_request_id"] or payment_request_id(
+                "create", order["id"]
+            )
+            connection.execute(
+                """
+                UPDATE orders
+                SET status = 'paypal_creating', paypal_create_request_id = ?, updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (create_request_id, utc_now(), order["id"], user["id"]),
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="TrustPay order is not eligible for PayPal checkout.",
+            )
+
+    if existing_paypal_order_id and existing_approval_url:
+        return {
+            "order_id": order["id"],
+            "paypal_order_id": existing_paypal_order_id,
+            "approval_url": existing_approval_url,
+            "status": "PENDING",
+        }
+
+    try:
+        token = await paypal_access_token()
+    except HTTPException:
+        if not existing_paypal_order_id:
+            with connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE orders
+                    SET status = 'approved', updated_at = ?
+                    WHERE id = ? AND user_id = ? AND status = 'paypal_creating'
+                    """,
+                    (utc_now(), order["id"], user["id"]),
+                )
+        raise
+
+    if existing_paypal_order_id:
+        try:
+            response_status, paypal_order = await paypal_api_request(
+                "GET",
+                f"/v2/checkout/orders/{quote(existing_paypal_order_id, safe='')}",
+                access_token=token,
+            )
+        except (PayPalTransportError, HTTPException) as error:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="PayPal order status could not be confirmed. Retry checkout after reconciliation.",
+            ) from error
+        if response_status != status.HTTP_200_OK:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="PayPal order status could not be confirmed.",
+            )
+        if paypal_order.get("id") != existing_paypal_order_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="PayPal returned a different order than the one approved.",
+            )
+        if paypal_order.get("status") == "COMPLETED":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="PayPal already reports a completed order. Return to the payment page to reconcile it.",
+            )
+        if paypal_order.get("status") != "CREATED":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="PayPal order is not awaiting buyer approval.",
+            )
+        validate_paypal_purchase_unit(paypal_order, order, existing_paypal_order_id)
+        approval_url = paypal_approval_url(paypal_order)
+        with connect() as connection:
+            connection.execute(
+                """
+                UPDATE orders
+                SET status = 'paypal_pending', paypal_approval_url = ?, updated_at = ?
+                WHERE id = ? AND user_id = ? AND status IN ('paypal_pending', 'reconciliation_required')
+                """,
+                (approval_url, utc_now(), order["id"], user["id"]),
+            )
+        return {
+            "order_id": order["id"],
+            "paypal_order_id": existing_paypal_order_id,
+            "approval_url": approval_url,
+            "status": "PENDING",
+        }
+
+    amount = f"{Decimal(str(order['total'])).quantize(Decimal('0.01')):.2f}"
     return_url = f"{FRONTEND_BASE_URL}/payment?order_id={order['id']}"
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(
-                f"{PAYPAL_API_BASE_URL}/v2/checkout/orders",
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json={
-                    "intent": "CAPTURE",
-                    "purchase_units": [{
-                        "reference_id": order["id"],
-                        "amount": {"currency_code": order["currency"], "value": amount},
-                    }],
-                    "application_context": {
-                        "brand_name": "TrustPay AI Sandbox Demo",
-                        "user_action": "PAY_NOW",
-                        "return_url": return_url,
-                        "cancel_url": f"{FRONTEND_BASE_URL}/payment?cancelled=1&order_id={order['id']}",
-                    },
+        response_status, paypal_order = await paypal_api_request(
+            "POST",
+            "/v2/checkout/orders",
+            payload={
+                "intent": "CAPTURE",
+                "purchase_units": [{
+                    "reference_id": order["id"],
+                    "amount": {"currency_code": order["currency"], "value": amount},
+                }],
+                "application_context": {
+                    "brand_name": "TrustPay AI Sandbox Demo",
+                    "user_action": "PAY_NOW",
+                    "return_url": return_url,
+                    "cancel_url": f"{FRONTEND_BASE_URL}/payment?cancelled=1&order_id={order['id']}",
                 },
+            },
+            request_id=create_request_id,
+            access_token=token,
+        )
+    except HTTPException:
+        with connect() as connection:
+            connection.execute(
+                """
+                UPDATE orders
+                SET status = 'reconciliation_required', updated_at = ?
+                WHERE id = ? AND user_id = ? AND status = 'paypal_creating'
+                """,
+                (utc_now(), order["id"], user["id"]),
             )
-            response.raise_for_status()
-            paypal_order = response.json()
-    except httpx.HTTPError as error:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="PayPal Sandbox could not create the checkout order.") from error
-    approval_url = next((link["href"] for link in paypal_order.get("links", []) if link.get("rel") == "approve"), None)
-    if not approval_url:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="PayPal Sandbox did not return an approval URL.")
+        add_audit(
+            user["id"],
+            "Payment reconciliation required",
+            f"PayPal order creation response could not be validated for order {order['id']}.",
+        )
+        raise
+    except PayPalTransportError as error:
+        with connect() as connection:
+            connection.execute(
+                """
+                UPDATE orders
+                SET status = 'reconciliation_required', updated_at = ?
+                WHERE id = ? AND user_id = ? AND status = 'paypal_creating'
+                """,
+                (utc_now(), order["id"], user["id"]),
+            )
+        add_audit(
+            user["id"],
+            "Payment reconciliation required",
+            f"PayPal order creation could not be confirmed for order {order['id']}.",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal order creation could not be confirmed. Retry with the same TrustPay order.",
+        ) from error
+
+    if not 200 <= response_status < 300:
+        next_status = "reconciliation_required" if response_status >= 500 else "approved"
+        with connect() as connection:
+            connection.execute(
+                """
+                UPDATE orders SET status = ?, updated_at = ?
+                WHERE id = ? AND user_id = ? AND status = 'paypal_creating'
+                """,
+                (next_status, utc_now(), order["id"], user["id"]),
+            )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal Sandbox could not create the checkout order.",
+        )
+
+    paypal_order_id = paypal_order.get("id")
+    if not isinstance(paypal_order_id, str) or not paypal_order_id or len(paypal_order_id) > 128:
+        with connect() as connection:
+            connection.execute(
+                """
+                UPDATE orders SET status = 'reconciliation_required', updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (utc_now(), order["id"], user["id"]),
+            )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal returned an invalid order identifier; reconciliation is required.",
+        )
+
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        latest_order = require_order(connection, order["id"], user["id"])
+        connection.execute(
+            """
+            UPDATE orders
+            SET paypal_order_id = ?, status = 'paypal_pending', updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (paypal_order_id, utc_now(), order["id"], user["id"]),
+        )
+    try:
+        if paypal_create_response_needs_refresh(paypal_order):
+            try:
+                refreshed_status, refreshed_order = await paypal_api_request(
+                    "GET",
+                    f"/v2/checkout/orders/{quote(paypal_order_id, safe='')}",
+                    access_token=token,
+                )
+            except (PayPalTransportError, HTTPException) as error:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="PayPal order details could not be confirmed.",
+                ) from error
+            if refreshed_status != status.HTTP_200_OK:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="PayPal order details could not be confirmed.",
+                )
+            paypal_order = refreshed_order
+
+        if paypal_order.get("id") != paypal_order_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="PayPal returned a different order than the one approved.",
+            )
+        if paypal_order.get("status") != "CREATED":
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="PayPal returned an unexpected order status.",
+            )
+        validate_paypal_purchase_unit(paypal_order, order, paypal_order_id)
+        approval_url = paypal_approval_url(paypal_order)
+    except HTTPException:
+        with connect() as connection:
+            connection.execute(
+                """
+                UPDATE orders SET status = 'reconciliation_required', updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (utc_now(), order["id"], user["id"]),
+            )
+        add_audit(
+            user["id"],
+            "Payment reconciliation required",
+            f"PayPal order response did not match TrustPay order {order['id']}.",
+        )
+        raise
+
+    latest_items = await current_cart(user["id"])
+    if not order_matches_cart(latest_order, latest_items):
+        with connect() as connection:
+            connection.execute(
+                """
+                UPDATE orders
+                SET status = 'reconciliation_required', updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (utc_now(), order["id"], user["id"]),
+            )
+        add_audit(
+            user["id"],
+            "Payment reconciliation required",
+            f"Cart changed while creating PayPal order for TrustPay order {order['id']}.",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cart changed while creating checkout. Cancel the PayPal order and reverify the cart.",
+        )
+
     with connect() as connection:
         connection.execute(
-            "UPDATE orders SET paypal_order_id = ?, status = 'paypal_pending', updated_at = ? WHERE id = ?",
-            (paypal_order["id"], utc_now(), order["id"]),
+            """
+            UPDATE orders
+            SET paypal_approval_url = ?, updated_at = ?
+            WHERE id = ? AND user_id = ? AND status = 'paypal_pending'
+            """,
+            (approval_url, utc_now(), order["id"], user["id"]),
         )
-    add_audit(user["id"], "Sandbox payment initiated", f"Created PayPal Sandbox order for TrustPay order {order['id']}.")
-    return {"order_id": order["id"], "paypal_order_id": paypal_order["id"], "approval_url": approval_url, "status": "PENDING"}
+    add_audit(
+        user["id"],
+        "Sandbox payment initiated",
+        f"Created PayPal Sandbox order for TrustPay order {order['id']}.",
+    )
+    return {
+        "order_id": order["id"],
+        "paypal_order_id": paypal_order_id,
+        "approval_url": approval_url,
+        "status": "PENDING",
+    }
 
 
 @app.post("/api/payments/capture-order")
@@ -726,71 +1559,303 @@ async def capture_payment(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         order = connection.execute(
             "SELECT * FROM orders WHERE paypal_order_id = ? AND user_id = ?",
             (payload.paypal_order_id, user["id"]),
         ).fetchone()
-    if order is None or order["status"] != "paypal_pending":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="PayPal order is not pending for this account.")
-    items = await current_cart(user["id"])
-    if not order_matches_cart(order, items):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Cart changed before payment capture.")
-    token = await paypal_access_token()
+        if order is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="PayPal order was not found for this account.",
+            )
+        if order["status"] == "completed":
+            existing = connection.execute(
+                "SELECT * FROM transactions WHERE order_id = ? AND user_id = ?",
+                (order["id"], user["id"]),
+            ).fetchone()
+            if existing is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Completed payment is missing its transaction record. Reconciliation is required.",
+                )
+            add_audit(
+                user["id"],
+                "Duplicate capture prevented",
+                f"Repeated capture request returned the existing transaction for order {order['id']}.",
+                connection,
+            )
+            return {
+                "id": existing["id"],
+                "order_id": existing["order_id"],
+                "paypal_reference": existing["paypal_reference"],
+                "amount": existing["amount"],
+                "currency": existing["currency"],
+                "date": existing["date"],
+                "status": "COMPLETED",
+                "method": existing["method"],
+                "product": existing["product"],
+                "cart_cleared": False,
+            }
+        if order["status"] == "cancelled":
+            response = payment_pending_response(order)
+            response["status"] = "CANCELLED"
+            return response
+        if order["status"] not in {
+            "paypal_pending",
+            "paypal_capturing",
+            "reconciliation_required",
+        }:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="PayPal order is not eligible for capture.",
+            )
+        verification = json.loads(order["checks_json"] or "{}")
+        if verification.get("status") != "Passed":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Backend verification must pass before payment capture.",
+            )
+        previous_status = order["status"]
+        capture_request_id = order["paypal_capture_request_id"] or payment_request_id(
+            "capture", order["id"]
+        )
+        connection.execute(
+            """
+            UPDATE orders
+            SET status = 'paypal_capturing', paypal_capture_request_id = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (capture_request_id, utc_now(), order["id"], user["id"]),
+        )
+
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(
-                f"{PAYPAL_API_BASE_URL}/v2/checkout/orders/{payload.paypal_order_id}/capture",
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json={},
+        token = await paypal_access_token()
+    except HTTPException:
+        set_payment_status(order["id"], user["id"], previous_status)
+        raise
+
+    add_audit(
+        user["id"],
+        "Payment capture requested",
+        f"Requested PayPal capture for TrustPay order {order['id']}.",
+    )
+    try:
+        paypal_status, paypal_order = await paypal_api_request(
+            "GET",
+            f"/v2/checkout/orders/{quote(payload.paypal_order_id, safe='')}",
+            access_token=token,
+        )
+    except HTTPException:
+        set_payment_status(order["id"], user["id"], previous_status)
+        raise
+    except PayPalTransportError:
+        set_payment_status(order["id"], user["id"], "reconciliation_required")
+        add_audit(
+            user["id"],
+            "Payment reconciliation required",
+            f"PayPal status could not be checked before capture for order {order['id']}.",
+        )
+        return payment_pending_response(order)
+
+    if paypal_status != status.HTTP_200_OK:
+        set_payment_status(order["id"], user["id"], "reconciliation_required")
+        add_audit(
+            user["id"],
+            "Payment reconciliation required",
+            f"PayPal status could not be checked before capture for order {order['id']}.",
+        )
+        return payment_pending_response(order)
+
+    provider_status = paypal_order.get("status")
+    if provider_status == "COMPLETED":
+        try:
+            capture_id, amount, currency = validate_paypal_capture(
+                paypal_order,
+                order,
+                payload.paypal_order_id,
             )
-            response.raise_for_status()
-            capture = response.json()
-    except httpx.HTTPError as error:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="PayPal Sandbox capture could not be completed.") from error
-    status_text = capture.get("status", "PENDING")
-    capture_entries = [
-        entry
-        for unit in capture.get("purchase_units", [])
-        for entry in unit.get("payments", {}).get("captures", [])
-    ]
-    paypal_reference = capture_entries[0].get("id") if capture_entries else payload.paypal_order_id
-    transaction_id = f"TRX-{uuid.uuid4().hex[:12].upper()}"
-    transaction_date = datetime.now(timezone.utc).date().isoformat()
-    if status_text == "COMPLETED":
-        with connect() as connection:
+        except HTTPException:
+            set_payment_status(order["id"], user["id"], "reconciliation_required")
+            add_audit(
+                user["id"],
+                "Payment reconciliation required",
+                f"PayPal payment did not match TrustPay order {order['id']}.",
+            )
+            raise
+        return record_completed_payment(
+            order,
+            user["id"],
+            payload.paypal_order_id,
+            capture_id,
+            amount,
+            currency,
+        )
+
+    if provider_status in {"VOIDED", "CANCELLED"}:
+        set_payment_status(order["id"], user["id"], "cancelled")
+        add_audit(
+            user["id"],
+            "Sandbox payment cancelled",
+            f"PayPal reported a cancelled order for TrustPay order {order['id']}.",
+        )
+        response = payment_pending_response(order)
+        response["status"] = "CANCELLED"
+        return response
+
+    if provider_status != "APPROVED":
+        set_payment_status(
+            order["id"],
+            user["id"],
+            "paypal_pending" if provider_status == "CREATED" else "reconciliation_required",
+        )
+        return payment_pending_response(order)
+
+    try:
+        validate_paypal_purchase_unit(paypal_order, order)
+    except HTTPException:
+        set_payment_status(order["id"], user["id"], "reconciliation_required")
+        add_audit(
+            user["id"],
+            "Payment reconciliation required",
+            f"PayPal order details did not match TrustPay order {order['id']}.",
+        )
+        raise
+
+    try:
+        capture_status, capture_response = await paypal_api_request(
+            "POST",
+            f"/v2/checkout/orders/{quote(payload.paypal_order_id, safe='')}/capture",
+            payload={},
+            request_id=capture_request_id,
+            access_token=token,
+        )
+    except (HTTPException, PayPalTransportError):
+        return await reconcile_paypal_order(
+            order,
+            user["id"],
+            payload.paypal_order_id,
+            token,
+        )
+
+    if not 200 <= capture_status < 300 or capture_response.get("status") != "COMPLETED":
+        return await reconcile_paypal_order(
+            order,
+            user["id"],
+            payload.paypal_order_id,
+            token,
+        )
+
+    try:
+        capture_id, amount, currency = validate_paypal_capture(
+            capture_response,
+            order,
+            payload.paypal_order_id,
+        )
+    except HTTPException:
+        set_payment_status(order["id"], user["id"], "reconciliation_required")
+        add_audit(
+            user["id"],
+            "Payment reconciliation required",
+            f"PayPal capture details did not match TrustPay order {order['id']}.",
+        )
+        raise
+    return record_completed_payment(
+        order,
+        user["id"],
+        payload.paypal_order_id,
+        capture_id,
+        amount,
+        currency,
+    )
+
+
+@app.post("/api/payments/cancel-order")
+async def cancel_payment_order(
+    payload: VerifyOrderRequest,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        order = require_order(connection, payload.order_id, user["id"])
+        if order["status"] == "completed":
+            existing = connection.execute(
+                "SELECT * FROM transactions WHERE order_id = ? AND user_id = ?",
+                (order["id"], user["id"]),
+            ).fetchone()
+            if existing is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Completed payment is missing its transaction record. Reconciliation is required.",
+                )
+            return {
+                "id": existing["id"],
+                "order_id": existing["order_id"],
+                "paypal_reference": existing["paypal_reference"],
+                "amount": existing["amount"],
+                "currency": existing["currency"],
+                "date": existing["date"],
+                "status": "COMPLETED",
+                "method": existing["method"],
+                "product": existing["product"],
+                "cart_cleared": False,
+            }
+        if order["status"] == "cancelled":
+            response = payment_pending_response(order)
+            response["status"] = "CANCELLED"
+            return response
+        if order["status"] == "approved" and not order["paypal_order_id"]:
             connection.execute(
-                """INSERT INTO transactions
-                   (id, user_id, order_id, product, amount, currency, date, method, status, verification, paypal_reference)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    transaction_id, user["id"], order["id"],
-                    ", ".join(item["product"].get("title", "Product") for item in items),
-                    order["total"], order["currency"], transaction_date, "PayPal Sandbox",
-                    "Completed", "Backend verified", paypal_reference,
-                ),
+                """
+                UPDATE orders SET status = 'cancelled', updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (utc_now(), order["id"], user["id"]),
             )
+            paypal_order_id = None
+        elif order["status"] in {"paypal_pending", "reconciliation_required"}:
+            if not order["paypal_order_id"]:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="PayPal order cannot be cancelled until its status is reconciled.",
+                )
+            paypal_order_id = order["paypal_order_id"]
             connection.execute(
-                "UPDATE orders SET status = 'completed', updated_at = ? WHERE id = ?",
-                (utc_now(), order["id"]),
+                """
+                UPDATE orders SET status = 'paypal_reconciling', updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (utc_now(), order["id"], user["id"]),
             )
-        add_audit(user["id"], "Sandbox payment completed", f"PayPal Sandbox capture status: COMPLETED for order {order['id']}.")
-    else:
-        with connect() as connection:
-            connection.execute(
-                "UPDATE orders SET status = ?, updated_at = ? WHERE id = ?",
-                (f"paypal_{status_text.lower()}", utc_now(), order["id"]),
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="TrustPay order is not eligible for cancellation.",
             )
-        add_audit(user["id"], "Sandbox payment pending", f"PayPal Sandbox returned status {status_text} for order {order['id']}.")
-    return {
-        "id": transaction_id if status_text == "COMPLETED" else None,
-        "order_id": order["id"],
-        "paypal_reference": paypal_reference,
-        "amount": order["total"],
-        "currency": order["currency"],
-        "date": transaction_date,
-        "status": status_text,
-        "method": "PayPal Sandbox",
-    }
+
+    if paypal_order_id is None:
+        add_audit(
+            user["id"],
+            "Sandbox payment cancelled",
+            f"Customer cancelled TrustPay order {order['id']} before PayPal checkout.",
+        )
+        response = payment_pending_response(order)
+        response["status"] = "CANCELLED"
+        return response
+
+    try:
+        token = await paypal_access_token()
+    except HTTPException:
+        set_payment_status(order["id"], user["id"], "reconciliation_required")
+        raise
+
+    return await reconcile_paypal_order(
+        order,
+        user["id"],
+        paypal_order_id,
+        token,
+        cancel_if_unpaid=True,
+    )
 
 
 @app.get("/api/transactions")
