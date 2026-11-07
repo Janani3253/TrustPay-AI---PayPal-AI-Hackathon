@@ -507,8 +507,17 @@ export function PaymentPage() {
         }
       })
       .finally(() => { if (active) setProcessing(false) })
-    return () => { active = false }
+    return () => { active = false; returnHandled.current = false }
   }, [searchParams])
+
+  useEffect(() => {
+    if (!processing || payment || paymentError) return
+    const timer = setTimeout(() => {
+      setPaymentError('The backend did not respond in time. Click "Check payment status" to retry.')
+      setProcessing(false)
+    }, 120_000)
+    return () => clearTimeout(timer)
+  }, [processing, payment, paymentError])
 
   const retryPaymentStatus = async () => {
     if (processing) return
