@@ -9,7 +9,7 @@ import secrets
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -57,6 +57,7 @@ SECRET_KEY = os.getenv("TRUSTPAY_SECRET_KEY", "local-development-key-change-befo
 TOKEN_TTL_SECONDS = 60 * 60 * 8
 FEE_SHIPPING = 9.99
 FEE_TAX_RATE = 0.05
+FX_API_BASE_URL = "https://api.frankfurter.dev/v2/rate"
 
 app = FastAPI(title="TrustPay AI IntentLock API", version="0.1.0")
 allowed_origins = [
@@ -198,6 +199,154 @@ async def dummyjson_get(path: str, params: dict[str, Any] | None = None) -> Any:
         ) from error
 
 
+async def _fetch_catalogue_products() -> list[dict[str, Any]]:
+    page_size = 100
+    result = await dummyjson_get("/products", {"limit": page_size, "skip": 0})
+    if not isinstance(result, dict) or not isinstance(result.get("products"), list):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="The product catalogue returned an invalid product list.",
+        )
+    if any(not isinstance(product, dict) for product in result["products"]):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="The product catalogue returned an invalid product record.",
+        )
+
+    products = list(result["products"])
+    total = result.get("total")
+    if total is None:
+        return products
+    if isinstance(total, bool) or not isinstance(total, int) or total < len(products):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="The product catalogue returned invalid pagination metadata.",
+        )
+
+    while len(products) < total:
+        page = await dummyjson_get(
+            "/products",
+            {"limit": page_size, "skip": len(products)},
+        )
+        if not isinstance(page, dict) or not isinstance(page.get("products"), list):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="The product catalogue returned an invalid product page.",
+            )
+        page_products = page["products"]
+        if not page_products or any(not isinstance(product, dict) for product in page_products):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="The product catalogue returned an incomplete product page.",
+            )
+        page_total = page.get("total", total)
+        if (
+            isinstance(page_total, bool)
+            or not isinstance(page_total, int)
+            or page_total < len(products) + len(page_products)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="The product catalogue returned invalid pagination metadata.",
+            )
+        total = page_total
+        products.extend(page_products)
+
+    unique_products: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        product_id = product.get("id")
+        if product_id is not None:
+            key = str(product_id)
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+        unique_products.append(product)
+    return unique_products
+
+
+async def get_exchange_rate(base: str, quote: str) -> dict[str, Any] | None:
+    today = datetime.now(timezone.utc).date()
+
+    if base not in {"USD", "INR"} or quote not in {"USD", "INR"}:
+        return None
+
+    if base == quote:
+        return {"rate": 1.0, "date": today.isoformat()}
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(
+                f"{FX_API_BASE_URL}/{base}/{quote}",
+                params={"date": today.isoformat()},
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        rate = Decimal(str(data["rate"]))
+        rate_date = datetime.strptime(data["date"], "%Y-%m-%d").date()
+
+        age_days = (today - rate_date).days
+
+        if (
+            not rate.is_finite()
+            or rate <= 0
+            or age_days < 0
+            or age_days > 7
+        ):
+            return None
+
+        return {"rate": float(rate), "date": rate_date.isoformat()}
+
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, InvalidOperation):
+        return None
+
+
+def convert_currency_amount(
+    amount: float | Decimal,
+    base: str,
+    quote: str,
+    exchange_rate_info: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if base not in {"USD", "INR"} or quote not in {"USD", "INR"}:
+        return None
+
+    try:
+        value = Decimal(str(amount))
+        if not value.is_finite() or value < 0:
+            return None
+
+        if base == quote:
+            rate = Decimal("1")
+            rate_date = (
+                str(exchange_rate_info["date"])
+                if exchange_rate_info and exchange_rate_info.get("date")
+                else datetime.now(timezone.utc).date().isoformat()
+            )
+        else:
+            if not exchange_rate_info:
+                return None
+            rate = Decimal(str(exchange_rate_info["rate"]))
+            rate_date = str(exchange_rate_info["date"])
+            if not rate.is_finite() or rate <= 0 or not rate_date:
+                return None
+
+        datetime.strptime(rate_date, "%Y-%m-%d")
+        converted = (value * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        converted_float = float(converted)
+        if not Decimal(str(converted_float)).is_finite():
+            return None
+        return {
+            "amount": converted_float,
+            "rate": float(rate),
+            "date": rate_date,
+        }
+    except (InvalidOperation, KeyError, TypeError, ValueError):
+        return None
+
+
 async def fetch_product(product_id: int) -> dict[str, Any]:
     product = await dummyjson_get(f"/products/{product_id}")
     if not isinstance(product, dict) or product.get("id") != product_id:
@@ -231,32 +380,486 @@ def cart_price(items: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+_REQUEST_STOP_WORDS = {
+    "a", "an", "the", "and", "or", "with", "for", "of", "in", "on", "to",
+    "my", "me", "please", "want", "need", "buy", "find", "looking", "search",
+    "under", "below", "less", "than", "maximum", "max", "minimum", "min",
+    "budget", "up", "at", "least", "more", "between", "from", "to", "price",
+    "do", "not", "dont", "no", "add", "without", "exclude", "excluding",
+    "prefer", "preferably", "ideally", "optional", "would", "like", "only",
+    "must", "require", "required", "has", "have", "that", "is", "are", "be",
+    "it", "its", "by", "brand", "manufacturer", "size", "sized",
+    "quantity", "qty", "units", "unit", "pieces", "piece", "pairs", "pair",
+    "trusted", "seller", "sellers", "accessory", "accessories",
+    "usd", "inr", "rupee", "rupees", "dollar", "dollars", "rs",
+}
+_KNOWN_BRANDS = (
+    "samsung", "apple", "dell", "hp", "lenovo", "xiaomi", "redmi",
+    "oneplus", "oppo", "vivo", "sony", "asus", "acer", "motorola",
+    "google", "realme", "nokia", "nike", "adidas", "lg", "microsoft",
+    "bose", "boat", "philips", "panasonic", "whirlpool", "haier",
+)
+_BRAND_ALIASES = {
+    "iphone": "apple",
+    "ipad": "apple",
+    "macbook": "apple",
+    "galaxy": "samsung",
+    "thinkpad": "lenovo",
+    "pixel": "google",
+}
+_CATEGORY_PATTERNS = (
+    (r"\b(laptops?|notebooks?|computers?)\b", "laptops", "laptop"),
+    (r"\b(?:android\s+)?(?:phones?|mobiles?|smartphones?|iphones?)\b", "smartphones", "phone"),
+    (r"\btablets?\b", "tablets", "tablet"),
+    (r"\b(tvs?|televisions?)\b", "televisions", "television"),
+    (r"\b(headphones?|earphones?|headsets?)\b", "headphones", "headphone"),
+    (r"\bwatches?\b", "watches", "watch"),
+    (r"\b(shoes?|sneakers?|trainers?)\b", "shoes", "shoe"),
+    (r"\bshirts?\b", "mens-shirts", "shirt"),
+    (r"\bdresses?\b", "womens-dresses", "dress"),
+    (r"\btables?\b", "furniture", "table"),
+    (r"\bchairs?\b", "furniture", "chair"),
+    (r"\bfurniture\b", "furniture", "furniture"),
+    (r"\b(?:refrigerators?|fridges?)\b", "appliances", "refrigerator"),
+    (r"\bwashing machines?\b", "appliances", "washing machine"),
+)
+_CATEGORY_ALIASES = {
+    "smartphones": {"phone", "mobile", "smartphone", "android", "iphone"},
+    "laptops": {"laptop", "notebook", "computer"},
+    "tablets": {"tablet"},
+    "televisions": {"tv", "television"},
+    "headphones": {"headphone", "earphone", "headset"},
+    "audio": {"audio"},
+    "shoes": {"shoe", "sneaker", "trainer"},
+    "watches": {"watch", "smartwatch"},
+    "shirts": {"shirt", "tshirt"},
+    "dresses": {"dress"},
+    "tables": {"table"},
+    "chairs": {"chair"},
+    "furniture": {"furniture"},
+    "appliances": {"appliance"},
+    "refrigerators": {"refrigerator", "fridge"},
+    "washing-machines": {"washer", "washing machine"},
+}
+_SPECIFICATION_PATTERNS = (
+    (r"(?P<value>\d+(?:\.\d+)?\s?(?:gb|tb))\s?ram\b", "RAM"),
+    (r"(?P<value>\d+(?:\.\d+)?\s?(?:gb|tb))\s?(?:ssd|hdd|storage)\b", "Storage"),
+    (r"\b(?P<value>(?:intel\s*)?i[3579]|ryzen\s*[3579])\b", "Processor"),
+    (r"\b(?P<value>5g)\b", "Network"),
+    (r"\b(?:size|sized)\s+(?:of\s+)?(?P<value>[a-z0-9]+)\b", "Size"),
+)
+
+
+def _normalized_tokens(value: Any) -> set[str]:
+    tokens = set()
+    for token in re.findall(r"[a-z0-9]+", str(value).lower()):
+        if len(token) > 1 and token.endswith("ies"):
+            token = token[:-3] + "y"
+        elif len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+            token = token[:-1]
+        tokens.add(token)
+    return tokens
+
+
+def _extract_requirements(text: str) -> list[dict[str, Any]]:
+    requirements: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for pattern, label in _SPECIFICATION_PATTERNS:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            value = match.group("value")
+            key = (label.casefold(), re.sub(r"[^a-z0-9]", "", value.casefold()))
+            if key not in seen:
+                requirements.append({"name": label, "value": value})
+                seen.add(key)
+
+    broad_units = (
+        r"gb|tb|mb|litres?|liters?|l|ml|cm|mm|metres?|meters?|m|"
+        r"inches?|inch|in|kg|g|mah|w|watts?|hz|mp|megapixels?"
+    )
+    for match in re.finditer(
+        rf"\b(?P<operator>at least|minimum(?: of)?|no less than)?\s*"
+        rf"(?P<value>\d+(?:\.\d+)?\s*(?:{broad_units}))\s*"
+        rf"(?P<name>capacity|storage|memory|ram|screen|display|size|weight|"
+        rf"dimensions?|width|height|depth|resolution|power|battery)?\b",
+        text,
+        re.IGNORECASE,
+    ):
+        value = match.group("value").strip()
+        name = (match.group("name") or "Specification").title()
+        operator = "minimum" if match.group("operator") else "exact"
+        key = (name.casefold(), re.sub(r"[^a-z0-9]", "", value.casefold()))
+        if key not in seen and not any(
+            old_name == name.casefold() and old_value.startswith(key[1])
+            for old_name, old_value in seen
+        ):
+            requirements.append({"name": name, "value": value, "operator": operator})
+            seen.add(key)
+
+    for pattern, name in [
+        (r"\b(black|white|red|blue|green|yellow|pink|purple|grey|gray|brown)\b", "Color"),
+        (r"\b(cotton|wooden|wood|leather|stainless steel|plastic|metal)\b", "Material"),
+        (r"\b(wireless|bluetooth|waterproof|water-resistant|noise cancellation|"
+         r"noise-cancelling|4k|8k|oled|led|touchscreen|gaming)\b", "Feature"),
+    ]:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            value = match.group(1)
+            key = (name.casefold(), re.sub(r"[^a-z0-9]", "", value.casefold()))
+            if key not in seen:
+                requirements.append({"name": name, "value": value})
+                seen.add(key)
+    return requirements
+
+
+def _extract_exclusions(text: str) -> list[dict[str, str]]:
+    exclusions: list[dict[str, str]] = []
+    for match in re.finditer(
+        r"\b(?:without|excluding|exclude|no(?!\s+(?:less|more)\s+than))\s+"
+        r"(?P<value>[a-z][a-z -]*?)(?=\s+(?:under|below|less than|for|with|in|size)\b|[,.;]|$)",
+        text,
+        re.IGNORECASE,
+    ):
+        value = match.group("value").strip()
+        if not value or value.casefold() in {"accessories", "accessory"}:
+            continue
+        name = "Material" if value.casefold() in {
+            "leather", "wood", "wooden", "cotton", "plastic", "metal", "stainless steel",
+        } else "Feature"
+        exclusions.append({"name": name, "value": value})
+    return exclusions
+
+
+def _extract_brands(text: str, catalogue_brands: set[str] | None = None) -> list[str]:
+    lowered = text.lower()
+    candidates = set(_KNOWN_BRANDS)
+    candidates.update(brand.lower() for brand in (catalogue_brands or set()) if brand.strip())
+    requested = [
+        brand for brand in candidates
+        if re.search(r"(?<![a-z0-9])" + re.escape(brand) + r"(?![a-z0-9])", lowered)
+    ]
+    explicit_brand = re.search(
+        r"\b(?:brand(?:ed)?|manufacturer|by|from)\s+"
+        r"(?P<brand>[a-z][a-z0-9&.-]*)",
+        lowered,
+    )
+    if explicit_brand and explicit_brand.group("brand") not in _REQUEST_STOP_WORDS:
+        requested.append(explicit_brand.group("brand"))
+    for alias, brand in _BRAND_ALIASES.items():
+        if re.search(r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", lowered):
+            requested.append(brand)
+    return sorted(set(requested))
+
+
+def _product_brand_matches(
+    requested_brands: list[str],
+    product: dict[str, Any],
+) -> bool | None:
+    if not requested_brands:
+        return None
+    catalogue_brand = str(product.get("brand") or "").strip()
+    brand_evidence = catalogue_brand or str(product.get("title") or "")
+    available_brand_tokens = _normalized_tokens(brand_evidence)
+    return all(
+        _normalized_tokens(brand_name).issubset(available_brand_tokens)
+        for brand_name in requested_brands
+    )
+
+
+def _product_category_evidence(product: dict[str, Any]) -> str:
+    evidence = [str(product.get("title") or "")]
+    tags = product.get("tags", [])
+    if isinstance(tags, list):
+        evidence.extend(str(tag) for tag in tags)
+    return " ".join(evidence)
+
+
+def _mandatory_query_text(text: str) -> str:
+    return re.split(
+        r",\s*prefer\b|\b(?:preferably|ideally|optional)\b",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+
+
+def _category_families(value: str) -> set[str]:
+    tokens = _normalized_tokens(value)
+    return {
+        family
+        for family, aliases in _CATEGORY_ALIASES.items()
+        if any(_normalized_tokens(alias).issubset(tokens) for alias in aliases)
+    }
+
+
+def _category_vocabulary(category: str, category_terms: list[str]) -> set[str]:
+    values = [category, *category_terms]
+    families = set().union(*(_category_families(value) for value in values))
+    vocabulary = set().union(*(_normalized_tokens(value) for value in values))
+    for family in families:
+        vocabulary.update(
+            token
+            for alias in _CATEGORY_ALIASES[family]
+            for token in _normalized_tokens(alias)
+            if token not in {"android", "iphone"}
+        )
+    return vocabulary
+
+
+def _mandatory_request_terms(
+    text: str,
+    requirements: list[dict[str, Any]],
+    category: str = "",
+    category_terms: list[str] | None = None,
+) -> set[str]:
+    required_text = _mandatory_query_text(text)
+    required_text = re.sub(
+        r"\b(?:without|excluding|exclude|no(?!\s+(?:less|more)\s+than))\s+[^,.]+",
+        " ",
+        required_text,
+        flags=re.IGNORECASE,
+    )
+    required_text = re.sub(
+        r"\b(?:buy|get|need|want|find|quantity(?: of)?|qty)\s+\d+\s*"
+        r"(?:units?|items?|pieces?|pairs?)?\b",
+        " ",
+        required_text,
+        flags=re.IGNORECASE,
+    )
+    required_text = re.sub(
+        r"\b(?:between|from)\s*(?:[^\w\s]\s*|rs\.?\s*|inr\s*|usd\s*)?"
+        r"\d[\d,]*(?:\.\d+)?\s*(?:and|to|-)\s*"
+        r"(?:[^\w\s]\s*|rs\.?\s*|inr\s*|usd\s*)?\d[\d,]*(?:\.\d+)?",
+        " ",
+        required_text,
+        flags=re.IGNORECASE,
+    )
+    for requirement in requirements:
+        value = str(requirement.get("value", "")).strip()
+        if not value:
+            continue
+        required_text = re.sub(
+            r"(?<![a-z0-9])" + re.escape(value) + r"(?![a-z0-9])",
+            " ",
+            required_text,
+            flags=re.IGNORECASE,
+        )
+    required_text = re.sub(
+        r"(?:under|below|less than|no more than|maximum|max|budget(?: of)?|up to|"
+        r"between|from|at least|minimum(?: of)?|no less than)\s*"
+        r"(?:[^\w\s]\s*|rs\.?\s*|inr\s*|usd\s*)?\d[\d,]*(?:\.\d+)?\s*k?",
+        " ",
+        required_text,
+        flags=re.IGNORECASE,
+    )
+    terms = {
+        token for token in _normalized_tokens(required_text) - _REQUEST_STOP_WORDS
+        if len(token) > 1
+    }
+    terms.difference_update(_category_vocabulary(category, category_terms or []))
+    return terms
+
+
+def _structured_product_fields(product: dict[str, Any]) -> list[tuple[str, str]]:
+    fields: list[tuple[str, str]] = []
+    specifications = product.get("specifications")
+    if isinstance(specifications, dict):
+        fields.extend((str(key), str(value)) for key, value in specifications.items())
+    elif isinstance(specifications, list):
+        for value in specifications:
+            text = str(value)
+            key, separator, field_value = text.partition(":")
+            fields.append((key.strip(), field_value.strip()) if separator else ("Specification", text))
+    for key in ("ram", "storage", "capacity", "size", "color", "colour", "material",
+                "connectivity", "features", "resolution", "model", "modelNumber", "sku"):
+        value = product.get(key)
+        if value is not None:
+            fields.append((key, str(value)))
+    dimensions = product.get("dimensions")
+    if isinstance(dimensions, dict):
+        fields.extend((str(key), str(value)) for key, value in dimensions.items())
+    tags = product.get("tags")
+    if isinstance(tags, list):
+        fields.extend(("features", str(tag)) for tag in tags)
+    return fields
+
+
+def _structured_product_text(product: dict[str, Any]) -> str:
+    return " ".join(f"{key} {value}" for key, value in _structured_product_fields(product))
+
+
+def _measurement_base(value: str) -> tuple[str, Decimal] | None:
+    match = re.search(r"(\d+(?:\.\d+)?)\s*([a-z]+)", value.casefold())
+    if not match:
+        return None
+    amount = Decimal(match.group(1))
+    unit = match.group(2)
+    units = {
+        "tb": ("storage", Decimal(1024 * 1024)),
+        "gb": ("storage", Decimal(1024)),
+        "mb": ("storage", Decimal(1)),
+        "litre": ("volume", Decimal(1000)),
+        "litres": ("volume", Decimal(1000)),
+        "liter": ("volume", Decimal(1000)),
+        "liters": ("volume", Decimal(1000)),
+        "l": ("volume", Decimal(1000)),
+        "ml": ("volume", Decimal(1)),
+        "kg": ("mass", Decimal(1000)),
+        "g": ("mass", Decimal(1)),
+        "metre": ("length", Decimal(1000)),
+        "metres": ("length", Decimal(1000)),
+        "meter": ("length", Decimal(1000)),
+        "meters": ("length", Decimal(1000)),
+        "m": ("length", Decimal(1000)),
+        "cm": ("length", Decimal(10)),
+        "mm": ("length", Decimal(1)),
+        "inch": ("length", Decimal("25.4")),
+        "inches": ("length", Decimal("25.4")),
+        "in": ("length", Decimal("25.4")),
+    }
+    unit_info = units.get(unit)
+    return (unit_info[0], amount * unit_info[1]) if unit_info else None
+
+
+def _requirement_is_verified(requirement: dict[str, Any], product: dict[str, Any]) -> bool:
+    field_aliases = {
+        "ram": {"ram", "memory"},
+        "storage": {"storage", "ssd", "hdd"},
+        "size": {"size"},
+        "color": {"color", "colour"},
+        "material": {"material"},
+        "feature": {"feature", "features", "connectivity", "resolution", "network"},
+        "capacity": {"capacity"},
+        "weight": {"weight"},
+        "dimensions": {"dimensions", "width", "height", "depth", "screen", "display"},
+        "width": {"width", "dimensions"},
+        "height": {"height", "dimensions"},
+        "depth": {"depth", "dimensions"},
+        "resolution": {"resolution", "display", "screen"},
+        "power": {"power", "battery"},
+        "battery": {"battery", "power"},
+        "processor": {"processor", "cpu"},
+        "network": {"network", "connectivity"},
+        "model": {"model", "modelnumber", "sku"},
+    }
+    name = str(requirement.get("name", "Specification")).casefold()
+    normalized_name_tokens = _normalized_tokens(name)
+    aliases = (
+        None if name in {"specification", "other"}
+        else field_aliases.get(name, normalized_name_tokens or {name})
+    )
+    all_fields = _structured_product_fields(product)
+    selected_fields = [
+        (key, value)
+        for key, value in all_fields
+        if aliases is None
+        or re.sub(r"[^a-z0-9]", "", key.casefold()) in aliases
+        or (
+            re.sub(r"[^a-z0-9]", "", key.casefold()) == "specification"
+            and bool(aliases and aliases.intersection(_normalized_tokens(value)))
+        )
+    ]
+    if not selected_fields:
+        return False
+    structured = " ".join(f"{key} {value}" for key, value in selected_fields)
+    requested = str(requirement.get("value", "")).strip()
+    value_aliases = {
+        "wooden": "wood",
+        "wood": "wooden",
+        "litre": "liter",
+        "litres": "liters",
+        "colour": "color",
+        "grey": "gray",
+    }
+    normalized_requested = re.sub(r"[^a-z0-9]", "", requested.casefold())
+    normalized_evidence = re.sub(r"[^a-z0-9]", "", structured.casefold())
+    if not normalized_requested:
+        return False
+    if normalized_requested in normalized_evidence:
+        return True
+    alias = value_aliases.get(requested.casefold())
+    normalized_alias = re.sub(r"[^a-z0-9]", "", alias.casefold()) if alias else ""
+    if normalized_alias and normalized_alias in normalized_evidence:
+        return True
+    requested_measurement = _measurement_base(requested)
+    if not requested_measurement:
+        return False
+    for value_match in re.finditer(r"\d+(?:\.\d+)?\s*[a-z]+", structured.casefold()):
+        evidence_measurement = _measurement_base(value_match.group())
+        if not evidence_measurement or evidence_measurement[0] != requested_measurement[0]:
+            continue
+        if (
+            evidence_measurement[1] >= requested_measurement[1]
+            if requirement.get("operator") == "minimum"
+            else evidence_measurement[1] == requested_measurement[1]
+        ):
+            return True
+    return False
+
+
+def _exclusion_is_verified(exclusion: dict[str, str], product: dict[str, Any]) -> tuple[bool, bool]:
+    structured = _structured_product_text(product)
+    normalized_evidence = re.sub(r"[^a-z0-9]", "", structured.casefold())
+    name_tokens = _normalized_tokens(exclusion["name"])
+    value = re.sub(r"[^a-z0-9]", "", exclusion["value"].casefold())
+    attribute_present = bool(name_tokens.intersection(_normalized_tokens(structured)))
+    excluded_value_present = bool(value and value in normalized_evidence)
+    return attribute_present, excluded_value_present
+
+
+def _category_matches_product(
+    product_category: str,
+    category: str,
+    category_terms: list[str],
+    explicit: bool,
+    product_evidence: str = "",
+) -> bool:
+    if not category and not category_terms:
+        return True
+    normalized_category = re.sub(r"[^a-z0-9]+", "-", category.casefold()).strip("-")
+    normalized_product_category = re.sub(
+        r"[^a-z0-9]+", "-", product_category.casefold()
+    ).strip("-")
+    if explicit and not category_terms and normalized_category in {
+        "mens-watches", "womens-watches", "mens-shoes", "womens-shoes",
+        "mens-shirts", "womens-dresses",
+    }:
+        return normalized_product_category == normalized_category
+
+    requested_families = set().union(
+        *(_category_families(term) for term in category_terms)
+    ) if category_terms else set()
+    if not requested_families:
+        requested_families = _category_families(category)
+
+    product_families = _category_families(product_category)
+    if product_families.intersection({"furniture", "appliances", "audio"}):
+        product_families.update(_category_families(product_evidence))
+    if requested_families:
+        return bool(requested_families.intersection(product_families))
+    return normalized_product_category == normalized_category
+
+
 def parse_intent(payload: IntentRequest) -> dict[str, Any]:
     text = payload.request
     lowered = text.lower()
-    requirements = []
-    for pattern, label in [
-        (r"(\d+\s?gb)\s?ram", "RAM"),
-        (r"(\d+\s?gb\s?(?:ssd|storage))", "Storage"),
-        (r"\b((?:intel\s*)?i[3579])\b", "Processor"),
-    ]:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            requirements.append({"name": label, "value": match.group(1)})
+    mandatory_text = _mandatory_query_text(text)
+    requirements = _extract_requirements(mandatory_text)
+    exclusions = _extract_exclusions(text)
+    for exclusion in exclusions:
+        requirements = [
+            requirement for requirement in requirements
+            if str(requirement.get("value", "")).casefold() != exclusion["value"].casefold()
+        ]
     inferred_category = ""
-    for pattern, category in [
-        (r"\b(laptop|notebook|computer)\b", "laptops"),
-        (r"\b(phone|mobile|smartphone)\b", "smartphones"),
-        (r"\btablet\b", "tablets"),
-        (r"\bwatch\b", "mens-watches"),
-        (r"\b(shoe|sneaker)\b", "mens-shoes"),
-        (r"\b(shirt|dress|clothing)\b", "womens-dresses"),
-    ]:
-        if re.search(pattern, lowered):
+    category_terms: list[str] = []
+    for pattern, category, term in _CATEGORY_PATTERNS:
+        if re.search(pattern, mandatory_text, re.IGNORECASE):
             inferred_category = category
+            category_terms = [term]
             break
+
     budget_match = re.search(
-        r"(?:under|below|less than|maximum|max|budget(?: of)?|up to)\s*(?:₹|\$)?\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?",
+        r"(?:under|below|less than|no more than|maximum|max|budget(?: of)?|up to)\s*"
+        r"(?:₹|rs\.?|inr|\$|usd)?\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?",
         text,
         re.IGNORECASE,
     )
@@ -264,34 +867,140 @@ def parse_intent(payload: IntentRequest) -> dict[str, Any]:
     if budget_match:
         parsed = float(budget_match.group(1).replace(",", ""))
         budget = parsed * (1000 if budget_match.group(2) else 1)
+
+    minimum_budget = None
+    minimum_match = re.search(
+        r"(?:at least|no less than|minimum(?: of)?|from)\s*(?:₹|rs\.?|inr|\$|usd)\s*"
+        r"(\d[\d,]*(?:\.\d+)?)\s*(k)?",
+        text,
+        re.IGNORECASE,
+    )
+    range_match = re.search(
+        r"\b(?:between|from)\s*(?:₹|rs\.?|inr|\$|usd)?\s*(\d[\d,]*(?:\.\d+)?)\s*"
+        r"(?:and|to|-)\s*(?:₹|rs\.?|inr|\$|usd)?\s*(\d[\d,]*(?:\.\d+)?)",
+        text,
+        re.IGNORECASE,
+    )
+    if range_match:
+        minimum_budget = float(range_match.group(1).replace(",", ""))
+        budget = float(range_match.group(2).replace(",", ""))
+    elif minimum_match:
+        minimum_budget = float(minimum_match.group(1).replace(",", ""))
+        if minimum_match.group(2):
+            minimum_budget *= 1000
+
     currency = payload.currency
     if re.search(r"\$|usd|dollars?", text, re.IGNORECASE):
         currency = "USD"
-    elif re.search(r"₹|inr|rupees?", text, re.IGNORECASE):
+    elif re.search(r"₹|rs\.?|inr|rupees?", text, re.IGNORECASE):
         currency = "INR"
+
+    quantity_match = re.search(
+        r"\b(?:buy|get|need|want|find|quantity(?: of)?|qty)\s+(\d+)\s*"
+        r"(?:units?|items?|pieces?|pairs?)?\b",
+        lowered,
+    )
+    if not quantity_match:
+        quantity_match = re.search(
+            r"\b(\d+)\s+(?:units?|items?|pieces?|pairs?|laptops?|phones?|"
+            r"smartphones?|tablets?|watches?|shoes?|shirts?|tables?)\b",
+            lowered,
+        )
+    quantity = int(quantity_match.group(1)) if quantity_match else 1
+    category = payload.category or inferred_category
     return {
         "request": text,
-        "category": payload.category or inferred_category,
+        "category": category,
+        "categoryIsExplicit": bool(payload.category),
+        "categoryTerms": category_terms,
         "requirements": requirements,
+        "exclusions": exclusions,
+        "mandatoryTerms": sorted(
+            _mandatory_request_terms(text, requirements, category, category_terms)
+        ),
+        "minimumBudget": minimum_budget,
         "maximumBudget": budget,
+        "quantity": quantity,
         "currency": currency,
         "trustedSellersOnly": payload.trustedSellersOnly,
         "platformId": payload.platformId,
-        "excludeAccessories": bool(re.search(r"\b(?:do not|don't|no)\s+add\s+accessories\b", lowered)),
+        "excludeAccessories": bool(
+            re.search(
+                r"\b(?:do not|don't|no)\s+add\s+accessories\b|"
+                r"\b(?:without|excluding|exclude|no)\s+accessories\b",
+                lowered,
+            )
+        ),
     }
 
 
-def build_verification(items: list[dict[str, Any]], intent: dict[str, Any], order_version: int) -> dict[str, Any]:
+def build_verification(
+    items: list[dict[str, Any]],
+    intent: dict[str, Any],
+    order_version: int,
+    converted_total: float | None = None,
+    exchange_rate: float | None = None,
+    exchange_rate_date: str | None = None,
+) -> dict[str, Any]:
     totals = cart_price(items)
-    categories = {item["product"].get("category", "") for item in items}
     requirements = intent.get("requirements", [])
-    category_ok = not intent.get("category") or categories == {intent["category"]}
+    category_ok = all(
+        _category_matches_product(
+            str(item["product"].get("category", "")),
+            str(intent.get("category", "")),
+            intent.get("categoryTerms", []) if isinstance(intent.get("categoryTerms", []), list) else [],
+            bool(intent.get("categoryIsExplicit", bool(intent.get("category")))),
+            _product_category_evidence(item["product"]),
+        )
+        for item in items
+    )
     accessory_items = [
         item["product"].get("title", "")
         for item in items
         if re.search(r"\b(accessory|accessories|case|charger|cable|adapter)\b", item["product"].get("title", ""), re.I)
     ]
-    currency_ok = intent.get("currency") == totals["currency"]
+    budget_currency = intent.get("currency", "USD")
+    try:
+        budget_amount = Decimal(str(intent.get("maximumBudget", 0) or 0))
+        has_budget = budget_amount.is_finite() and budget_amount > 0
+    except (InvalidOperation, TypeError, ValueError):
+        budget_amount = Decimal("0")
+        has_budget = False
+
+    try:
+        converted_budget_total = Decimal(str(converted_total))
+        within_budget = (
+            has_budget
+            and converted_budget_total.is_finite()
+            and converted_budget_total <= budget_amount
+        )
+    except (InvalidOperation, TypeError, ValueError):
+        within_budget = False
+    if not has_budget:
+        price_reason = "A valid customer budget is unavailable; the order cannot be safely compared."
+    elif converted_total is None:
+        price_reason = (
+            f"Exchange rate unavailable; the USD order total could not be safely "
+            f"compared with the {budget_currency} budget."
+        )
+    elif not within_budget:
+        price_reason = (
+            f"Estimated total ${totals['total']:.2f} converts to "
+            f"{budget_currency} {converted_total:.2f}, exceeding the "
+            f"{budget_currency} budget of {budget_amount:.2f}."
+        )
+    else:
+        price_reason = (
+            f"Estimated total ${totals['total']:.2f} converts to "
+            f"{budget_currency} {converted_total:.2f}, within the "
+            f"{budget_currency} budget of {budget_amount:.2f}."
+        )
+    if exchange_rate is not None:
+        price_reason += (
+            f" Conversion rate: 1 USD = {exchange_rate} {budget_currency} "
+            f"(rate date: {exchange_rate_date})."
+        )
+
     checks = [
         {
             "name": "Product type",
@@ -331,14 +1040,8 @@ def build_verification(items: list[dict[str, Any]], intent: dict[str, Any], orde
         },
         {
             "name": "Final price",
-            "status": "Failed" if not currency_ok or totals["total"] > float(intent.get("maximumBudget", 0)) else "Passed",
-            "reason": (
-                f"Budget is {intent.get('currency')}, but catalogue prices are {totals['currency']}; no conversion is assumed."
-                if not currency_ok
-                else f"Estimated total ${totals['total']:.2f} exceeds the ${float(intent.get('maximumBudget', 0)):.2f} budget."
-                if totals["total"] > float(intent.get("maximumBudget", 0))
-                else f"Estimated total ${totals['total']:.2f} is within the stated budget."
-            ),
+            "status": "Passed" if within_budget else "Failed",
+            "reason": price_reason,
             "critical": True,
         },
         {
@@ -354,6 +1057,14 @@ def build_verification(items: list[dict[str, Any]], intent: dict[str, Any], orde
         "checks": checks,
         "order_version": order_version,
         "totals": totals,
+        "budgetComparison": {
+            "amount": converted_total,
+            "currency": budget_currency,
+            "exchangeRate": exchange_rate,
+            "exchangeRateBase": "USD",
+            "exchangeRateQuote": budget_currency,
+            "exchangeRateDate": exchange_rate_date,
+        },
     }
 
 
@@ -1056,55 +1767,546 @@ async def recommendations(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     intent = payload.get("intent")
+
     if not isinstance(intent, dict):
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="An intent object is required.")
-    category = intent.get("category")
-    query = intent.get("request", "").strip()
-    if category:
-        if not isinstance(category, str) or not re.fullmatch(r"[a-z0-9-]{1,80}", category):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid product category.")
-        result = await dummyjson_get(f"/products/category/{quote(category, safe='')}", {"limit": 200})
-    else:
-        result = await dummyjson_get("/products/search", {"q": " ".join(query.split()[:3]), "limit": 200})
-    enriched = []
-    budget = float(intent.get("maximumBudget", 0))
-    for product in result.get("products", []):
-        matched_category = not category or product.get("category") == category
-        currency_matches = intent.get("currency") == "USD"
-        total = float(product.get("price", 0)) * 1.05 + FEE_SHIPPING
-        budget_matches = currency_matches and total <= budget
-        matches = [
-            {
-                "name": requirement.get("name", "Specification"),
-                "requested": requirement.get("value", ""),
-                "status": "Not available for verification",
-                "explanation": "The public product catalogue does not provide this technical specification.",
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="An intent object is required.",
+        )
+
+    query = intent.get("request", "")
+    if not isinstance(query, str) or not query.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A valid shopping request is required.",
+        )
+
+    raw_category = intent.get("category") or ""
+    category_explicit_value = intent.get("categoryIsExplicit")
+    category_is_explicit = (
+        category_explicit_value
+        if isinstance(category_explicit_value, bool)
+        else bool(raw_category)
+    )
+    if raw_category and (
+        not isinstance(raw_category, str)
+        or not re.fullmatch(r"[a-z0-9-]{1,80}", raw_category)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid product category.",
+        )
+
+    raw_currency = str(intent.get("currency", "USD")).upper()
+    parser_currency = raw_currency if raw_currency in {"USD", "INR"} else "USD"
+    try:
+        parser_budget = Decimal(str(intent.get("maximumBudget", 1) or 1))
+        if not parser_budget.is_finite() or parser_budget <= 0:
+            parser_budget = Decimal("1")
+    except (InvalidOperation, TypeError, ValueError):
+        parser_budget = Decimal("1")
+    parsed_request = parse_intent(IntentRequest(
+        request=query,
+        maximumBudget=float(parser_budget),
+        currency=parser_currency,
+        trustedSellersOnly=bool(intent.get("trustedSellersOnly", False)),
+    ))
+    parsed_price_range = bool(re.search(
+        r"\b(?:under|below|less than|no more than|maximum|max|budget(?: of)?|"
+        r"up to|between|from)\b\s*(?:[^\w\s]\s*|rs\.?\s*|inr\s*|usd\s*)?\d",
+        query,
+        re.IGNORECASE,
+    ))
+
+    if category_is_explicit and raw_category:
+        category = raw_category
+        normalized_raw_category = raw_category.casefold()
+        parsed_category_families = _category_families(parsed_request["category"])
+        raw_category_families = _category_families(raw_category)
+        if (
+            parsed_category_families.intersection(raw_category_families)
+            and normalized_raw_category not in {
+                "mens-watches", "womens-watches", "mens-shoes",
+                "womens-shoes", "mens-shirts", "womens-dresses",
             }
-            for requirement in intent.get("requirements", [])
+        ):
+            category_terms = parsed_request["categoryTerms"]
+        else:
+            category_terms = []
+    else:
+        category = parsed_request["category"] or raw_category
+        category_terms = parsed_request["categoryTerms"] or intent.get("categoryTerms", [])
+    if not isinstance(category_terms, list):
+        category_terms = []
+    category_terms = [str(term) for term in category_terms if str(term).strip()]
+
+    client_requirements = intent.get("requirements", [])
+    if not isinstance(client_requirements, list):
+        client_requirements = []
+    requirements = [
+        requirement for requirement in client_requirements
+        if isinstance(requirement, dict)
+    ]
+    requirements.extend(parsed_request["requirements"])
+    unique_requirements: dict[tuple[str, str], dict[str, Any]] = {}
+    for requirement in requirements:
+        key = (
+            str(requirement.get("name", "Specification")).casefold(),
+            re.sub(r"[^a-z0-9]", "", str(requirement.get("value", "")).casefold()),
+        )
+        unique_requirements.setdefault(key, requirement)
+    requirements = list(unique_requirements.values())
+
+    client_exclusions = intent.get("exclusions", [])
+    if not isinstance(client_exclusions, list):
+        client_exclusions = []
+    exclusions = [
+        exclusion for exclusion in client_exclusions
+        if isinstance(exclusion, dict)
+    ] + parsed_request["exclusions"]
+    exclusions = list({
+        (
+            str(exclusion.get("name", "Feature")).casefold(),
+            str(exclusion.get("value", "")).casefold(),
+        ): exclusion
+        for exclusion in exclusions
+    }.values())
+    excluded_values = {
+        str(exclusion.get("value", "")).casefold()
+        for exclusion in exclusions
+    }
+    requirements = [
+        requirement for requirement in requirements
+        if str(requirement.get("value", "")).casefold() not in excluded_values
+    ]
+    intent = dict(intent)
+    intent["category"] = category
+    intent["categoryTerms"] = category_terms
+    intent["categoryIsExplicit"] = bool(category_is_explicit and raw_category)
+    intent["requirements"] = requirements
+    intent["exclusions"] = exclusions
+    if parsed_price_range:
+        intent["maximumBudget"] = parsed_request["maximumBudget"]
+    if parsed_request["minimumBudget"] is not None:
+        intent["minimumBudget"] = parsed_request["minimumBudget"]
+    elif "minimumBudget" not in intent:
+        intent["minimumBudget"] = None
+    if re.search(r"\$|usd|dollars?", query, re.IGNORECASE):
+        intent["currency"] = "USD"
+    elif re.search(r"₹|rs\.?|inr|rupees?", query, re.IGNORECASE):
+        intent["currency"] = "INR"
+    elif raw_currency:
+        intent["currency"] = raw_currency
+    if parsed_request["quantity"] != 1:
+        intent["quantity"] = parsed_request["quantity"]
+    intent["excludeAccessories"] = bool(
+        intent.get("excludeAccessories") or parsed_request["excludeAccessories"]
+    )
+
+    products = await _fetch_catalogue_products()
+    catalogue_brands = {
+        str(product.get("brand", "")).strip()
+        for product in products
+        if isinstance(product, dict) and str(product.get("brand", "")).strip()
+    }
+    requested_brands = _extract_brands(_mandatory_query_text(query), catalogue_brands)
+    mandatory_terms = _mandatory_request_terms(
+        query, requirements, category, category_terms
+    )
+
+    keywords = {
+        token for token in _normalized_tokens(query) - _REQUEST_STOP_WORDS
+        if not token.isdigit()
+    }
+    for requirement in requirements:
+        keywords.difference_update(_normalized_tokens(requirement.get("value", "")))
+        keywords.difference_update(_normalized_tokens(requirement.get("name", "")))
+    keywords.difference_update(_normalized_tokens(str(intent.get("maximumBudget", ""))))
+    keywords.difference_update(_normalized_tokens(str(intent.get("minimumBudget", ""))))
+    keywords.difference_update(_normalized_tokens(" ".join(requested_brands)))
+    keywords.difference_update(_normalized_tokens(category))
+    for term in category_terms:
+        keywords.difference_update(_normalized_tokens(term))
+
+    currency = str(intent.get("currency", "USD")).upper()
+
+    try:
+        budget_decimal = Decimal(str(intent.get("maximumBudget", 0) or 0))
+        has_budget = budget_decimal.is_finite() and budget_decimal > 0
+    except (InvalidOperation, TypeError, ValueError):
+        budget_decimal = Decimal("0")
+        has_budget = False
+    invalid_maximum_budget = (
+        intent.get("maximumBudget") is not None
+        and not has_budget
+    )
+
+    try:
+        minimum_budget = Decimal(str(intent.get("minimumBudget")))
+        has_minimum_budget = minimum_budget.is_finite() and minimum_budget > 0
+    except (InvalidOperation, TypeError, ValueError):
+        minimum_budget = Decimal("0")
+        has_minimum_budget = False
+    invalid_minimum_budget = (
+        intent.get("minimumBudget") is not None
+        and not has_minimum_budget
+    )
+
+    try:
+        quantity = int(intent.get("quantity", 1))
+        quantity_is_valid = 1 <= quantity <= 99
+        if not quantity_is_valid:
+            quantity = 1
+    except (TypeError, ValueError):
+        quantity_is_valid = False
+        quantity = 1
+
+    product_currencies = {
+        str(product.get("currency") or "USD").upper()
+        for product in products
+        if isinstance(product, dict)
+    }
+    exchange_rates: dict[str, dict[str, Any] | None] = {}
+    for product_currency in product_currencies:
+        exchange_rates[product_currency] = await get_exchange_rate(product_currency, currency)
+
+    enriched = []
+    rejection_reasons: set[str] = set()
+
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+
+        product_category = str(product.get("category", ""))
+        title = str(product.get("title", ""))
+        brand = str(product.get("brand", ""))
+        tags = product.get("tags", [])
+        if not isinstance(tags, list):
+            tags = []
+        specifications_text = _structured_product_text(product)
+        product_text = " ".join(
+            [title, brand, product_category, specifications_text]
+            + [str(tag) for tag in tags]
+        )
+        product_tokens = _normalized_tokens(product_text)
+
+        matched_category = _category_matches_product(
+            product_category,
+            category,
+            category_terms,
+            bool(category_is_explicit),
+            _product_category_evidence(product),
+        )
+        if not matched_category:
+            rejection_reasons.add(f"category {category or ' '.join(category_terms)}")
+            continue
+
+        if intent.get("excludeAccessories") and re.search(
+            r"\b(accessory|accessories|case|charger|cable|adapter)\b",
+            title,
+            re.IGNORECASE,
+        ):
+            rejection_reasons.add("accessory exclusion")
+            continue
+
+        brand_matched = _product_brand_matches(requested_brands, product)
+        keyword_hits = len(keywords.intersection(product_tokens))
+        name_relevance = keyword_hits / len(keywords) if keywords else 0.0
+
+        try:
+            price_decimal = Decimal(str(product["price"]))
+            price_is_valid = price_decimal.is_finite() and price_decimal >= 0
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            price_decimal = Decimal("0")
+            price_is_valid = False
+
+        product_currency = str(product.get("currency") or "USD").upper()
+        rate_info = exchange_rates.get(product_currency)
+        estimated_totals = (
+            cart_price([{"product": {"price": float(price_decimal)}, "quantity": quantity}])
+            if price_is_valid
+            else None
+        )
+        converted_price = (
+            convert_currency_amount(price_decimal, product_currency, currency, rate_info)
+            if price_is_valid
+            else None
+        )
+        converted_shipping = (
+            convert_currency_amount(estimated_totals["shipping"], product_currency, currency, rate_info)
+            if estimated_totals
+            else None
+        )
+        converted_tax = (
+            convert_currency_amount(estimated_totals["tax"], product_currency, currency, rate_info)
+            if estimated_totals
+            else None
+        )
+        converted_total = (
+            convert_currency_amount(estimated_totals["total"], product_currency, currency, rate_info)
+            if estimated_totals
+            else None
+        )
+        comparison_amount = converted_total["amount"] if converted_total else None
+        budget_matches = (
+            comparison_amount is not None
+            and Decimal(str(comparison_amount)) <= budget_decimal
+        ) if has_budget and comparison_amount is not None else None
+        minimum_budget_matches = (
+            converted_price is not None
+            and Decimal(str(converted_price["amount"])) >= minimum_budget
+        ) if has_minimum_budget else True
+
+        matches = []
+        for requirement in requirements:
+            name = str(requirement.get("name", "Specification"))
+            requested = str(requirement.get("value", ""))
+            verified = _requirement_is_verified(requirement, product)
+            if verified:
+                match_status = "Matched"
+                explanation = (
+                    "The requested value is present in structured product catalogue data."
+                )
+            else:
+                match_status = "Not available for verification"
+                explanation = (
+                    "The public catalogue does not provide structured technical "
+                    "information to verify this specification."
+                )
+
+            matches.append({
+                "name": name,
+                "requested": requested,
+                "status": match_status,
+                "explanation": explanation,
+            })
+
+        all_specs_mentioned = bool(matches) and all(
+            match["status"] == "Matched" for match in matches
+        )
+        exclusion_checks = [
+            _exclusion_is_verified(exclusion, product)
+            for exclusion in exclusions
+            if isinstance(exclusion.get("name"), str)
+            and isinstance(exclusion.get("value"), str)
         ]
-        available_signals = 1 + int(currency_matches)
-        percentage = round(
-            (int(matched_category) + int(bool(budget_matches))) / max(available_signals, 1) * 100
+        constraints = []
+        if intent.get("excludeAccessories"):
+            constraints.append({
+                "name": "No accessories",
+                "status": "Matched",
+                "explanation": "No excluded accessory was found in the product title.",
+            })
+        if intent.get("trustedSellersOnly"):
+            constraints.append({
+                "name": "Trusted seller",
+                "status": "Not available for verification",
+                "explanation": "Seller identity and trust status are not supplied by the catalogue.",
+            })
+
+        exclusions_satisfied = (
+            len(exclusion_checks) == len(exclusions)
+            and all(attribute_present and not excluded_value_present
+                    for attribute_present, excluded_value_present in exclusion_checks)
         )
-        recommendation_status = (
-            "Budget Exceeded" if currency_matches and not budget_matches
-            else "Currency Mismatch" if not currency_matches
-            else "Matches Requirements" if matched_category and not matches
-            else "Specification Mismatch" if matched_category and matches
-            else "Category Mismatch"
+        failed_requirements = []
+        missing_terms = mandatory_terms - product_tokens
+        if missing_terms:
+            failed_requirements.extend(sorted(missing_terms))
+        if requested_brands and brand_matched is not True:
+            failed_requirements.extend(f"brand {brand}" for brand in requested_brands)
+        failed_requirements.extend(
+            f"{match['name']} {match['requested']}"
+            for match in matches
+            if match["status"] != "Matched"
         )
+        if not exclusions_satisfied:
+            failed_requirements.extend(
+                f"excluded characteristic {exclusion.get('value', '')}"
+                for exclusion in exclusions
+            )
+        if has_budget and budget_matches is not True:
+            failed_requirements.append(
+                f"maximum budget in {currency}"
+                if comparison_amount is not None
+                else f"currency conversion to {currency}"
+            )
+        if has_minimum_budget and not minimum_budget_matches:
+            failed_requirements.append(f"minimum budget in {currency}")
+        if invalid_maximum_budget:
+            failed_requirements.append("valid maximum budget")
+        if invalid_minimum_budget:
+            failed_requirements.append("valid minimum budget")
+        if not quantity_is_valid:
+            failed_requirements.append("valid requested quantity")
+        if not price_is_valid:
+            failed_requirements.append("valid catalogue price")
+        if failed_requirements:
+            rejection_reasons.update(failed_requirements)
+            continue
+
+        score_numerator = 35 * name_relevance
+        score_denominator = 35
+        if requested_brands:
+            score_denominator += 25
+            score_numerator += 25 if brand_matched else 0
+        if category:
+            score_denominator += 15
+            score_numerator += 15 if matched_category else 0
+        if requirements:
+            spec_evidence = sum(
+                0.5 if match["status"] == "Mentioned in catalogue (unverified)" else 0
+                for match in matches
+            ) / len(requirements)
+            score_denominator += 20
+            score_numerator += 20 * spec_evidence
+        if has_budget:
+            score_denominator += 15
+            score_numerator += 15 if budget_matches is True else 0
+        if constraints:
+            constraint_evidence = sum(
+                constraint["status"] == "Matched" for constraint in constraints
+            ) / len(constraints)
+            score_denominator += 10
+            score_numerator += 10 * constraint_evidence
+        percentage = round(score_numerator / score_denominator * 100)
+
+        requested_name_matched = bool(mandatory_terms) and mandatory_terms.issubset(product_tokens)
+        requested_brand_matched = not requested_brands or brand_matched is True
+        requested_specs_satisfied = not requirements or all_specs_mentioned
+        requested_constraints_satisfied = all(
+            constraint["status"] == "Matched" for constraint in constraints
+        )
+        budget_eligible = not has_budget or budget_matches is True
+        currency_verified = not has_budget or comparison_amount is not None
+        category_eligible = not category or matched_category
+        exact_match = (
+            requested_name_matched
+            and requested_brand_matched
+            and category_eligible
+            and requested_specs_satisfied
+            and requested_constraints_satisfied
+            and budget_eligible
+            and currency_verified
+        )
+        relevant = name_relevance > 0 or brand_matched is True
+        match_type = (
+            "Exact Match" if exact_match
+            else "Partial Match" if relevant or matched_category
+            else "No Match"
+        )
+
+        if has_budget and (converted_total is None or not price_is_valid):
+            recommendation_status = "Exchange Rate Unavailable"
+        elif has_budget and budget_matches is False:
+            recommendation_status = "Budget Exceeded"
+        elif category and not matched_category:
+            recommendation_status = "Category Mismatch"
+        elif requirements and not all_specs_mentioned:
+            recommendation_status = "Specifications Unverified"
+        elif any(constraint["status"] != "Matched" for constraint in constraints):
+            recommendation_status = "Constraint Verification Pending"
+        elif match_type != "Exact Match":
+            recommendation_status = match_type
+        else:
+            recommendation_status = "Matches Requirements"
+
+        verification_status = (
+            "Currency Verification Pending" if has_budget and not currency_verified
+            else "Specifications Unverified" if requirements
+            else "Constraint Verification Pending" if not requested_constraints_satisfied
+            else "Verified"
+        )
+        ranking_tier = (
+            0 if exact_match
+            else 1 if (
+                relevant
+                and budget_eligible
+                and currency_verified
+                and category_eligible
+                and verification_status == "Verified"
+            )
+            else 2 if relevant and budget_matches is False
+            else 3
+        )
+        exchange_rate = converted_total["rate"] if converted_total else None
+        exchange_rate_date = converted_total["date"] if converted_total else None
         enriched.append({
             "product": product,
             "analysis": {
                 "percentage": percentage,
+                "matchType": match_type,
+                "rankingTier": ranking_tier,
+                "nameRelevance": round(name_relevance, 4),
+                "nameMatched": requested_name_matched,
+                "requestedBrand": requested_brands[0] if requested_brands else None,
+                "brandMatched": brand_matched,
+                "brandMatchStatus": (
+                    "Matched" if brand_matched is True
+                    else "Not matched" if brand_matched is False
+                    else "Not requested" if not requested_brands
+                    else "Not available for verification"
+                ),
+                "verificationStatus": verification_status,
                 "categoryMatched": matched_category,
-                "budgetMatched": budget_matches if currency_matches else None,
+                "specificationsMatched": all_specs_mentioned if requirements else None,
+                "budgetMatched": budget_matches,
+                "budgetCurrency": currency if has_budget else None,
+                "budgetAmount": float(budget_decimal) if has_budget else None,
+                "cataloguePrice": float(price_decimal) if price_is_valid else None,
+                "catalogueCurrency": product_currency,
+                "convertedPrice": converted_price["amount"] if converted_price else None,
+                "convertedShipping": converted_shipping["amount"] if converted_shipping else None,
+                "convertedTax": converted_tax["amount"] if converted_tax else None,
+                "comparableTotal": comparison_amount,
+                "comparisonCurrency": currency,
+                "exchangeRate": exchange_rate,
+                "exchangeRateBase": product_currency,
+                "exchangeRateQuote": currency,
+                "exchangeRateDate": exchange_rate_date,
                 "matches": matches,
+                "constraints": constraints,
                 "status": recommendation_status,
             },
         })
-    add_audit(user["id"], "Product API data retrieved", f"Retrieved {len(enriched)} recommendation product(s).")
-    return {"recommendations": enriched, "total": len(enriched)}
+
+    status_priority = {
+        "Matches Requirements": 0,
+        "Specifications Unverified": 1,
+        "Budget Exceeded": 2,
+        "Exchange Rate Unavailable": 3,
+        "Category Mismatch": 4,
+    }
+    enriched.sort(
+        key=lambda item: (
+            item["analysis"]["rankingTier"],
+            status_priority.get(item["analysis"]["status"], 5),
+            -item["analysis"]["percentage"],
+        ),
+    )
+
+    add_audit(
+        user["id"],
+        "Product API data retrieved",
+        f"Retrieved {len(enriched)} relevant recommendation product(s).",
+    )
+
+    return {
+        "recommendations": enriched,
+        "total": len(enriched),
+        "message": (
+            None if enriched
+            else (
+                "No products matched all mandatory requirements"
+                + (
+                    f": {', '.join(sorted(rejection_reasons))}"
+                    if rejection_reasons
+                    else "."
+                )
+                + " No requirements were relaxed."
+            )
+        ),
+    }
 
 
 @app.get("/api/cart")
@@ -1217,7 +2419,30 @@ async def verify_order(
                 }],
             }
         else:
-            checks = build_verification(items, json.loads(order["intent_json"]), order["version"])
+            intent = json.loads(order["intent_json"])
+            budget_currency = intent.get("currency", "USD")
+
+            exchange_rate_info = await get_exchange_rate("USD", budget_currency)
+            converted_cart_total = convert_currency_amount(
+                cart_price(items)["total"],
+                "USD",
+                budget_currency,
+                exchange_rate_info,
+            )
+            converted_total = (
+                converted_cart_total["amount"] if converted_cart_total else None
+            )
+            exchange_rate = converted_cart_total["rate"] if converted_cart_total else None
+            exchange_rate_date = converted_cart_total["date"] if converted_cart_total else None
+
+            checks = build_verification(
+                items,
+                intent,
+                order["version"],
+                converted_total=converted_total,
+                exchange_rate=exchange_rate,
+                exchange_rate_date=exchange_rate_date,
+            )
         state = "verified" if checks["status"] == "Passed" else "verification_failed"
         connection.execute(
             "UPDATE orders SET status = ?, checks_json = ?, updated_at = ? WHERE id = ?",

@@ -22,7 +22,7 @@ import {
   updateCartProduct, verifyBackendAudit, verifyBackendOrder,
   type BackendPaymentResult, type ShoppingPlatform,
 } from '../services/backendService'
-import type { AuditEvent, BackendVerificationCheck, Currency, Product, ProductCategory, ProductRecommendation, Transaction } from '../types'
+import type { AuditEvent, BackendVerificationCheck, Currency, Product, ProductCategory, ProductMatchAnalysis, ProductRecommendation, Transaction } from '../types'
 
 function PageTitle({ eyebrow, title, description, action }: { eyebrow?: string; title: string; description?: string; action?: ReactNode }) {
   return <div className="page-title-row"><div>{eyebrow && <div className="eyebrow">{eyebrow}</div>}<h1>{title}</h1>{description && <p>{description}</p>}</div>{action}</div>
@@ -30,6 +30,50 @@ function PageTitle({ eyebrow, title, description, action }: { eyebrow?: string; 
 
 function ButtonLink({ to, children, variant = 'primary', icon }: { to: string; children: ReactNode; variant?: string; icon?: ReactNode }) {
   return <Link className={`btn ${variant}`} to={to}>{children}{icon}</Link>
+}
+
+function RecommendationPrice({ analysis }: { analysis: ProductMatchAnalysis }) {
+  const currency = analysis.comparisonCurrency
+  const formatConverted = (amount: number | null | undefined) =>
+    amount == null || !currency ? 'Unavailable' : formatMoney(amount, currency)
+
+  const budgetStatus = analysis.budgetMatched === true
+    ? 'Within budget including estimated fees'
+    : analysis.budgetMatched === false
+      ? 'Budget exceeded including estimated fees'
+      : 'Cannot determine; exchange rate or price is unavailable'
+  const recommendationStatus = analysis.status === 'Exchange Rate Unavailable'
+    ? 'Currency Verification Pending'
+    : analysis.status === 'Budget Exceeded'
+      ? 'Budget Exceeded'
+      : analysis.status === 'Specifications Unverified'
+        ? 'Specifications Unverified'
+        : analysis.matchType ?? analysis.status ?? 'Partial Match'
+
+  return (
+    <div className="match-analysis recommendation-price">
+      <b>{recommendationStatus}</b>
+      <div><span>Original catalogue price</span><em>{analysis.cataloguePrice == null ? 'Unavailable' : formatMoney(analysis.cataloguePrice, analysis.catalogueCurrency ?? 'USD')}</em></div>
+      <div><span>Converted catalogue price</span><em>{formatConverted(analysis.convertedPrice)}</em></div>
+      <div><span>Estimated shipping</span><em>{formatConverted(analysis.convertedShipping)}</em></div>
+      <div><span>Estimated tax</span><em>{formatConverted(analysis.convertedTax)}</em></div>
+      <div><span>Comparable total used for budget check</span><em>{formatConverted(analysis.comparableTotal)}</em></div>
+      <div><span>Budget status</span><em>{budgetStatus}</em></div>
+      <div><span>Brand match {analysis.requestedBrand ? `(${analysis.requestedBrand})` : ''}</span><em>{analysis.brandMatchStatus ?? 'Not available'}</em></div>
+      <div><span>Product-name relevance</span><em>{analysis.nameRelevance == null ? 'Not available' : `${Math.round(analysis.nameRelevance * 100)}%`}</em></div>
+      <div><span>Category match</span><em>{analysis.categoryMatched ? 'Matched' : 'Not matched'}</em></div>
+      {analysis.specificationsMatched !== undefined && analysis.specificationsMatched !== null && (
+        <div><span>Specification evidence</span><em>{analysis.specificationsMatched ? 'Mentioned, not independently verified' : 'Not available for verification'}</em></div>
+      )}
+      <div><span>Verification status</span><em>{analysis.verificationStatus ?? 'Not available'}</em></div>
+      {analysis.exchangeRate != null && analysis.exchangeRateDate && (
+        <small>
+          Exchange rate: 1 {analysis.exchangeRateBase} = {analysis.exchangeRate} {analysis.exchangeRateQuote}
+          · dated {analysis.exchangeRateDate}
+        </small>
+      )}
+    </div>
+  )
 }
 
 function ProductTile({ product, matched = false, matchPercent = '96%' }: { product: Product; matched?: boolean; matchPercent?: string }) {
@@ -321,8 +365,93 @@ export function ProductResultsPage() {
     }, 0)
     return () => { active = false; window.clearTimeout(timer) }
   }, [intent, retry, recordAudit])
-  const analyzed = [...items].sort((left, right) => right.analysis.percentage - left.analysis.percentage)
-  return <><PageTitle eyebrow="PERSONALIZED MATCHES" title="Products for your intent" description="Backend recommendation status and API product fields are shown without frontend security decisions." action={<ButtonLink to="/shopping-request" variant="btn-outline">Edit request</ButtonLink>} />{intent ? <div className="intent-summary-strip"><Sparkles size={17} /><span><b>Original request:</b> “{intent.request}”</span><span className="summary-budget">Budget {formatMoney(intent.maximumBudget, intent.currency)}</span></div> : <div className="info-banner"><CircleAlert size={18} /><span>Start with a shopping request for personalized matches.</span><Link to="/shopping-request">Create request</Link></div>}<div className="api-source-strip"><span className="api-live-dot" />{productDataSource}<span>Recommendation statuses come from the backend.</span></div>{loading && <div className="panel api-state"><span className="spinner" /><p>Searching supported product catalogue…</p></div>}{error && <div className="panel api-error"><CircleAlert size={25} /><h2>Backend recommendation service unavailable</h2><p>{error}</p><button className="btn btn-primary" onClick={() => setRetry((value) => value + 1)}>Retry product search</button></div>}{!loading && !error && <><div className="results-caption"><span>{analyzed.length} backend recommendation{analyzed.length === 1 ? '' : 's'}</span></div><div className="product-grid">{analyzed.length ? analyzed.map(({ product, analysis }) => <div key={product.id} className="result-product"><div className="match-summary"><span className="match-score">{analysis.percentage}%</span><div><b>{analysis.categoryMatched ? 'Category match' : 'Category mismatch'}</b><small>Backend recommendation result</small></div><span className="status-chip status-warning"><i />{analysis.status ?? 'Needs Review'}</span></div><ProductTile product={product} matched matchPercent={`${analysis.percentage}%`} /><div className="match-analysis"><b>Backend-reported requirements</b>{analysis.matches.length ? analysis.matches.map((requirement) => <div key={requirement.name}><span>{requirement.name}: {requirement.requested}</span><em>{requirement.status}</em></div>) : <p>No technical requirements were extracted.</p>}<div><span>Seller</span><em>Not available for verification</em></div><div><span>Budget comparison</span><em>{analysis.budgetMatched === null ? `Unavailable (${intent?.currency} budget, USD API price)` : analysis.budgetMatched ? 'Within budget including estimated fees' : 'Above budget including estimated fees'}</em></div><details><summary>API description (untrusted text)</summary><p>{product.description}</p></details></div></div>) : <div className="empty-state"><PackageCheck size={30} /><h3>No API products found</h3><p>Try editing the request or browsing all product categories.</p><button className="btn btn-outline" onClick={() => navigate('/products')}>Browse products</button></div>}</div></>}</>
+  const analyzed = items
+  return (
+    <>
+      <PageTitle
+        eyebrow="PERSONALIZED MATCHES"
+        title="Products for your intent"
+        description="Backend recommendation status and API product fields are shown without frontend security decisions."
+        action={<ButtonLink to="/shopping-request" variant="btn-outline">Edit request</ButtonLink>}
+      />
+      {intent ? (
+        <div className="intent-summary-strip">
+          <Sparkles size={17} />
+          <span><b>Original request:</b> “{intent.request}”</span>
+          <span className="summary-budget">Budget {formatMoney(intent.maximumBudget, intent.currency)}</span>
+        </div>
+      ) : (
+        <div className="info-banner">
+          <CircleAlert size={18} />
+          <span>Start with a shopping request for personalized matches.</span>
+          <Link to="/shopping-request">Create request</Link>
+        </div>
+      )}
+      <div className="api-source-strip">
+        <span className="api-live-dot" />
+        {productDataSource}
+        <span>Recommendation statuses come from the backend.</span>
+      </div>
+      {loading && <div className="panel api-state"><span className="spinner" /><p>Searching supported product catalogue…</p></div>}
+      {error && (
+        <div className="panel api-error">
+          <CircleAlert size={25} />
+          <h2>Backend recommendation service unavailable</h2>
+          <p>{error}</p>
+          <button className="btn btn-primary" onClick={() => setRetry((value) => value + 1)}>Retry product search</button>
+        </div>
+      )}
+      {!loading && !error && (
+        <>
+          <div className="results-caption">
+            <span>{analyzed.length} backend recommendation{analyzed.length === 1 ? '' : 's'}</span>
+          </div>
+          <div className="product-grid">
+            {analyzed.length ? analyzed.map(({ product, analysis }) => (
+              <div key={product.id} className="result-product">
+                <div className="match-summary">
+                  <span className="match-score">{analysis.percentage}%</span>
+                  <div>
+                    <b>{analysis.matchType ?? 'Partial Match'}</b>
+                    <small>{analysis.status === 'Exchange Rate Unavailable' ? 'Currency Verification Pending' : analysis.status}</small>
+                  </div>
+                  <span className="status-chip status-warning"><i />{analysis.status === 'Exchange Rate Unavailable' ? 'Currency Verification Pending' : analysis.status ?? 'Needs Review'}</span>
+                </div>
+                <ProductTile product={product} matched matchPercent={`${analysis.percentage}%`} />
+                <div className="match-analysis">
+                  <b>Backend-reported requirements</b>
+                  {analysis.matches.length ? analysis.matches.map((requirement) => (
+                    <div key={`${requirement.name}-${requirement.requested}`}>
+                      <span>{requirement.name}: {requirement.requested}</span>
+                      <em>{requirement.status}</em>
+                    </div>
+                  )) : <p>No technical requirements were extracted.</p>}
+                  {analysis.constraints?.map((constraint) => (
+                    <div key={constraint.name}>
+                      <span>{constraint.name}</span>
+                      <em>{constraint.status}</em>
+                    </div>
+                  ))}
+                  <RecommendationPrice analysis={analysis} />
+                  <details>
+                    <summary>API description (untrusted text)</summary>
+                    <p>{product.description}</p>
+                  </details>
+                </div>
+              </div>
+            )) : (
+              <div className="empty-state">
+                <PackageCheck size={30} />
+                <h3>No matching products found</h3>
+                <p>No catalogue products met all mandatory requirements. Your brand, category, specifications, and budget were not relaxed.</p>
+                <button className="btn btn-outline" onClick={() => navigate('/products')}>Browse products</button>
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </>
+  )
 }
 
 export function CartPage() {
@@ -332,7 +461,7 @@ export function CartPage() {
   const budgetCurrencyMatches = Boolean(intent && totals.currency === intent.currency)
   const overBudget = Boolean(budgetCurrencyMatches && intent && totals.total > intent.maximumBudget)
   const budgetUnavailable = Boolean(intent && totals.currency && !budgetCurrencyMatches)
-  const blocked = overBudget || budgetUnavailable || totals.hasMixedCurrencies
+  const blocked = overBudget || totals.hasMixedCurrencies
   const display = (amount: number) => formatMoney(amount, totals.currency ?? 'USD')
   const runCartUpdate = async (operation: () => Promise<void>, update: () => void) => {
     setCartError('')
@@ -343,7 +472,7 @@ export function CartPage() {
       notify(message, 'error')
     }
   }
-  return <><PageTitle eyebrow="YOUR ORDER" title="Shopping cart" description="Your cart and product details are synchronized with the backend." action={<ButtonLink to="/products" variant="btn-outline" icon={<ShoppingBag size={16} />}>Continue shopping</ButtonLink>} />{cartError && <div className="form-error">{cartError}</div>}{cart.length === 0 ? <div className="panel empty-cart"><div className="empty-icon"><ShoppingCart size={27} /></div><h2>Your cart is waiting</h2><p>Add products from the supported catalogue to build and verify an order.</p><ButtonLink to="/products" icon={<ArrowRight size={16} />}>Explore products</ButtonLink></div> : <div className="cart-layout"><section className="panel cart-items"><div className="cart-items-heading"><div><h2>Items <span>({cart.reduce((sum, item) => sum + item.quantity, 0)})</span></h2><p>Current backend product prices (USD)</p></div><span className="status-chip status-warning"><i /> Seller not verified by catalogue</span></div>{cart.map(({ product, quantity }) => <div className="cart-item" key={product.id}><img src={product.image} alt={product.name} /><div className="cart-item-main"><Link to="/products">{product.name}</Link><span className="seller-line"><CircleAlert size={13} />Seller: Not provided by catalogue</span><div className="quantity-control"><button aria-label="Decrease quantity" onClick={() => void runCartUpdate(quantity === 1 ? () => removeCartProduct(product.id) : () => updateCartProduct(product.id, quantity - 1), () => quantity === 1 ? removeFromCart(product.id) : setQuantity(product.id, quantity - 1))}>−</button><span>{quantity}</span><button aria-label="Increase quantity" onClick={() => void runCartUpdate(() => updateCartProduct(product.id, quantity + 1), () => setQuantity(product.id, quantity + 1))}>+</button></div></div><div className="cart-item-price"><b>{formatMoney(product.price * quantity, product.currency)}</b><button className="remove-btn" onClick={() => void runCartUpdate(() => removeCartProduct(product.id), () => removeFromCart(product.id))} aria-label={`Remove ${product.name}`}><Trash2 size={15} /></button></div></div>)}<div className="cart-note"><ShieldCheck size={17} /><span>Any backend cart change invalidates previous verification and approval.</span></div></section><aside className="panel order-summary"><h2>Order summary</h2><p className="summary-muted">Shipping and tax are itemized demo estimates</p><div className="summary-row"><span>Subtotal</span><b>{display(totals.subtotal)}</b></div><div className="summary-row"><span>Estimated shipping</span><b>{display(totals.shipping)}</b></div><div className="summary-row"><span>Estimated tax (5%)</span><b>{display(totals.tax)}</b></div><div className="summary-row total-row"><b>Total ({totals.currency ?? 'mixed currencies'})</b><strong>{display(totals.total)}</strong></div>{intent && <div className={`budget-status ${blocked ? 'budget-over' : ''}`}><span>{budgetUnavailable ? <CircleAlert size={16} /> : overBudget ? <CircleAlert size={16} /> : <CheckCircle2 size={16} />}{budgetUnavailable ? 'Currency mismatch — comparison unavailable' : overBudget ? 'Over your stated budget' : 'Within your stated budget'}</span><b>{formatMoney(intent.maximumBudget, intent.currency)}</b></div>}{blocked && <div className="form-error">{budgetUnavailable ? `Catalogue prices are ${totals.currency}; your policy budget is ${intent?.currency}. No currency conversion is assumed.` : 'Resolve the mixed currency or budget issue before continuing.'}</div>}<Link aria-disabled={blocked} onClick={(event) => { if (blocked) event.preventDefault() }} to="/verification" className={`btn btn-primary btn-full ${blocked ? 'disabled-link' : ''}`}>Verify my order <ShieldCheck size={16} /></Link><p className="checkout-safe"><LockKeyhole size={13} /> Backend verification required before approval</p></aside></div>}</>
+  return <><PageTitle eyebrow="YOUR ORDER" title="Shopping cart" description="Your cart and product details are synchronized with the backend." action={<ButtonLink to="/products" variant="btn-outline" icon={<ShoppingBag size={16} />}>Continue shopping</ButtonLink>} />{cartError && <div className="form-error">{cartError}</div>}{cart.length === 0 ? <div className="panel empty-cart"><div className="empty-icon"><ShoppingCart size={27} /></div><h2>Your cart is waiting</h2><p>Add products from the supported catalogue to build and verify an order.</p><ButtonLink to="/products" icon={<ArrowRight size={16} />}>Explore products</ButtonLink></div> : <div className="cart-layout"><section className="panel cart-items"><div className="cart-items-heading"><div><h2>Items <span>({cart.reduce((sum, item) => sum + item.quantity, 0)})</span></h2><p>Current backend product prices (USD)</p></div><span className="status-chip status-warning"><i /> Seller not verified by catalogue</span></div>{cart.map(({ product, quantity }) => <div className="cart-item" key={product.id}><img src={product.image} alt={product.name} /><div className="cart-item-main"><Link to="/products">{product.name}</Link><span className="seller-line"><CircleAlert size={13} />Seller: Not provided by catalogue</span><div className="quantity-control"><button aria-label="Decrease quantity" onClick={() => void runCartUpdate(quantity === 1 ? () => removeCartProduct(product.id) : () => updateCartProduct(product.id, quantity - 1), () => quantity === 1 ? removeFromCart(product.id) : setQuantity(product.id, quantity - 1))}>−</button><span>{quantity}</span><button aria-label="Increase quantity" onClick={() => void runCartUpdate(() => updateCartProduct(product.id, quantity + 1), () => setQuantity(product.id, quantity + 1))}>+</button></div></div><div className="cart-item-price"><b>{formatMoney(product.price * quantity, product.currency)}</b><button className="remove-btn" onClick={() => void runCartUpdate(() => removeCartProduct(product.id), () => removeFromCart(product.id))} aria-label={`Remove ${product.name}`}><Trash2 size={15} /></button></div></div>)}<div className="cart-note"><ShieldCheck size={17} /><span>Any backend cart change invalidates previous verification and approval.</span></div></section><aside className="panel order-summary"><h2>Order summary</h2><p className="summary-muted">Shipping and tax are itemized demo estimates</p><div className="summary-row"><span>Subtotal</span><b>{display(totals.subtotal)}</b></div><div className="summary-row"><span>Estimated shipping</span><b>{display(totals.shipping)}</b></div><div className="summary-row"><span>Estimated tax (5%)</span><b>{display(totals.tax)}</b></div><div className="summary-row total-row"><b>Total ({totals.currency ?? 'mixed currencies'})</b><strong>{display(totals.total)}</strong></div>{intent && <div className={`budget-status ${blocked ? 'budget-over' : ''}`}><span>{budgetUnavailable ? <CircleAlert size={16} /> : overBudget ? <CircleAlert size={16} /> : <CheckCircle2 size={16} />}{budgetUnavailable ? 'Budget check pending server verification — comparison unavailable' : overBudget ? 'Over your stated budget' : 'Within your stated budget'}</span><b>{formatMoney(intent.maximumBudget, intent.currency)}</b></div>}{blocked && <div className="form-error">{budgetUnavailable ? `Catalogue prices are ${totals.currency}; your policy budget is ${intent?.currency}. No currency conversion is assumed.` : 'Resolve the mixed currency or budget issue before continuing.'}</div>}<Link aria-disabled={blocked} onClick={(event) => { if (blocked) event.preventDefault() }} to="/verification" className={`btn btn-primary btn-full ${blocked ? 'disabled-link' : ''}`}>Verify my order <ShieldCheck size={16} /></Link><p className="checkout-safe"><LockKeyhole size={13} /> Backend verification required before approval</p></aside></div>}</>
 }
 
 export function VerificationPage() {

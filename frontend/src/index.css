@@ -153,7 +153,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .sidebar-brand .brand { font-size: 17px; }
 .sidebar-brand .brand-mark { width: 28px; height: 28px; }
 .workspace-label { margin: 35px 10px 10px; color: #a1aabc; font-size: 8px; font-weight: 750; letter-spacing: 1px; }
-.side-nav { display: grid; gap: 4px; }
+.side-nav { display: grid; flex: 1 1 auto; gap: 4px; min-height: 0; overflow-x: hidden; overflow-y: auto; padding-bottom: 1px; overscroll-behavior-y: contain; scroll-behavior: smooth; scrollbar-color: #d7dce8 transparent; scrollbar-width: thin; }
+.side-nav::-webkit-scrollbar { width: 5px; }
+.side-nav::-webkit-scrollbar-thumb { border-radius: 5px; background: #d7dce8; }
+.side-nav::-webkit-scrollbar-track { background: transparent; }
 .nav-link { position: relative; display: flex; height: 41px; align-items: center; gap: 12px; padding: 0 11px; border-radius: 7px; color: #737e93; font-size: 11px; font-weight: 580; transition: all .15s ease; }
 .nav-link:hover { color: var(--navy); background: #f7f8fc; }
 .nav-link.active { color: var(--blue); background: #eff3ff; font-weight: 690; }
@@ -539,6 +542,11 @@ td small { display: block; margin-top: 4px; color: #9ba4b4; font-size: 8px; }
 .match-analysis details { padding-top: 7px; border-top: 1px solid #eff1f5; color: #718097; font-size: 8px; }
 .match-analysis summary { cursor: pointer; font-weight: 650; }
 .match-analysis details p { margin: 6px 0 0; line-height: 1.5; overflow-wrap: anywhere; }
+.match-analysis > .recommendation-price { display: grid; gap: 8px; padding-top: 8px; border-top: 1px solid #eff1f5; }
+.recommendation-price > b { color: #35415b; font-size: 9px; }
+.recommendation-price > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 5px; color: #778398; font-size: 8px; }
+.recommendation-price em { color: #52617a; font-size: 8px; font-style: normal; text-align: right; }
+.recommendation-price small { color: #8792a5; font-size: 8px; }
 .mobile-menu, .mobile-close, .mobile-backdrop { display: none; }
 .is-collapsed .sidebar { width: 70px; padding-right: 10px; padding-left: 10px; }
 .is-collapsed .sidebar-brand .brand > span:not(.brand-mark), .is-collapsed .workspace-label, .is-collapsed .nav-link > span, .is-collapsed .nav-count, .is-collapsed .security-note span, .is-collapsed .profile-copy, .is-collapsed .logout-btn { display: none; }
@@ -584,6 +592,9 @@ td small { display: block; margin-top: 4px; color: #9ba4b4; font-size: 8px; }
   .landing-links { gap: 17px; }
   .auth-page { grid-template-columns: 36% 64%; }
   .auth-aside { padding-right: 9%; padding-left: 9%; }
+}
+@media (max-height: 500px) {
+  .security-note { display: none; }
 }
 @media (max-width: 600px) {
   .landing-page { padding: 0 20px; }

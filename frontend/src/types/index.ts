@@ -6,6 +6,7 @@ export interface ProductApiProduct {
   description: string
   category: string
   price: number
+  currency?: Currency
   rating: number
   brand?: string
   sku?: string
@@ -36,7 +37,7 @@ export interface Product {
   description: string
   category: string
   price: number
-  currency: 'USD'
+  currency: Currency
   seller: null
   sellerVerified: false
   rating: number
@@ -69,16 +70,45 @@ export interface PurchaseIntent {
 export interface RequirementMatch {
   name: string
   requested: string
-  status: 'Matched' | 'Not available for verification' | 'Not matched'
+  status: 'Matched' | 'Mentioned in catalogue (unverified)' | 'Not available for verification' | 'Not matched'
+  explanation: string
+}
+
+export interface RecommendationConstraint {
+  name: string
+  status: 'Matched' | 'Not available for verification'
   explanation: string
 }
 
 export interface ProductMatchAnalysis {
   percentage: number
+  matchType?: 'Exact Match' | 'Partial Match' | 'No Match'
+  rankingTier?: number
+  nameRelevance?: number
+  nameMatched?: boolean
+  requestedBrand?: string | null
+  brandMatched?: boolean | null
+  brandMatchStatus?: string
+  verificationStatus?: string
   categoryMatched: boolean
+  specificationsMatched?: boolean | null
   budgetMatched: boolean | null
   matches: RequirementMatch[]
-  status?: string
+  cataloguePrice?: number | null
+  catalogueCurrency?: Currency
+  convertedPrice?: number | null
+  convertedShipping?: number | null
+  convertedTax?: number | null
+  comparableTotal?: number | null
+  comparisonCurrency?: Currency
+  budgetCurrency?: Currency | null
+  budgetAmount?: number | null
+  exchangeRate?: number | null
+  exchangeRateBase?: Currency
+  exchangeRateQuote?: Currency
+  exchangeRateDate?: string | null
+  constraints?: RecommendationConstraint[]
+  status?: 'Matches Requirements' | 'Exact Match' | 'Partial Match' | 'No Match' | 'Budget Exceeded' | 'Specifications Unverified' | 'Constraint Verification Pending' | 'Exchange Rate Unavailable' | 'Category Mismatch'
 }
 
 export interface ProductRecommendation {
@@ -108,6 +138,14 @@ export interface BackendVerification {
   status: 'Passed' | 'Failed'
   checks: BackendVerificationCheck[]
   totals: { subtotal: number; shipping: number; tax: number; total: number; currency: Currency }
+  budgetComparison?: {
+    amount: number | null
+    currency: Currency
+    exchangeRate: number | null
+    exchangeRateBase: Currency
+    exchangeRateQuote: Currency
+    exchangeRateDate: string | null
+  }
 }
 
 export interface Transaction {

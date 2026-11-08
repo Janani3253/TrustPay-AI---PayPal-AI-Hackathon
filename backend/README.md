@@ -98,6 +98,8 @@ backend-only credentials are configured. Never use storefront scraping as a subs
 
 The backend implements JWT register/login/current-user endpoints, supported platform discovery, natural-language policy extraction, product listing/categories/details, recommendation analysis, per-user cart persistence, versioned orders, server-side IntentLock checks and approval, optional PayPal Sandbox create/capture, transactions, dashboard counters, and a SHA-256 linked audit log with integrity verification.
 
+Recommendation searches retrieve all DummyJSON product pages, normalize supported category aliases, and filter for category, brand, model/name terms, mandatory structured specifications, exclusions, and currency-aware budgets before ranking. Category words are checked against category metadata rather than required as literal title terms. Missing catalogue evidence does not count as a match, catalogue retrieval failures remain API errors, and no unrelated-category fallback is returned. Request parsing is deterministic; it does not independently authenticate catalogue claims.
+
 Verification deliberately reports specifications as needing review and seller status as unverified when the product catalogue does not provide those facts. The demonstration uses SQLite and estimated shipping/tax rates; it is not production-ready financial infrastructure.
 
 

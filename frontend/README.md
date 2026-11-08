@@ -26,7 +26,7 @@ npm run lint
 
 The backend proxies the configurable product source, defaulting to `https://dummyjson.com`. Set `DUMMYJSON_BASE_URL` in `backend\.env` to change it. The API client and typed mapping are isolated in `src/services/api.ts`, `src/services/backendService.ts`, and `src/services/productService.ts`.
 
-Products, descriptions, categories, ratings, images, brand/SKU/weight/dimensions when present, and prices come from DummyJSON. Prices are displayed in USD, the currency supplied by this API. No INR conversion is fabricated. A request using another currency cannot be reliably compared against API prices and will not pass the budget check. DummyJSON does not provide verified-seller information or many technical specifications, which are marked unavailable rather than inferred. API failures are shown explicitly; catalogue mock products are not substituted.
+Products, descriptions, categories, ratings, images, brand/SKU/weight/dimensions when present, and catalogue prices come from DummyJSON. The original catalogue amount and currency are preserved. For supported USD/INR comparisons, the backend uses date-based Frankfurter rates (no more than seven days old) and converts the product price, estimated shipping, and estimated tax before comparing the final estimate with the customer's budget. The backend returns the conversion rate and date; if the rate is unavailable, the product is not treated as budget-compliant. Estimated shipping and tax use the same backend calculation as order verification. DummyJSON does not provide verified-seller information or many technical specifications, which are marked unavailable rather than inferred. API failures are shown explicitly; catalogue mock products are not substituted.
 
 ## Frontend workflow
 
