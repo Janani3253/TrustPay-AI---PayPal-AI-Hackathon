@@ -175,6 +175,157 @@ class PayPalCaptureTests(unittest.TestCase):
                 0,
             )
 
+    def test_completed_transaction_details_use_persisted_order_and_verification(self) -> None:
+        with (
+            patch.object(main, "paypal_access_token", new=AsyncMock(return_value="test-token")),
+            patch.object(
+                main,
+                "paypal_api_request",
+                new=AsyncMock(side_effect=[
+                    (200, self.approved_paypal_order()),
+                    (201, self.completed_paypal_order()),
+                ]),
+            ),
+        ):
+            capture = self.capture()
+
+        self.assertEqual(capture.status_code, 200)
+        transaction_id = capture.json()["id"]
+        intent = {
+            "request": "I need a laptop under ₹1,000",
+            "category": "laptops",
+            "requirements": [{"name": "RAM", "value": "16GB"}],
+            "maximumBudget": 1000,
+            "currency": "INR",
+            "trustedSellersOnly": False,
+            "platformId": "dummyjson",
+        }
+        checks = {
+            "status": "Passed",
+            "checks": [{
+                "name": "Final price",
+                "status": "Passed",
+                "reason": "Within budget.",
+                "critical": True,
+            }],
+            "totals": {
+                "subtotal": 10.0,
+                "shipping": 0.0,
+                "tax": 0.0,
+                "total": 10.0,
+                "currency": "USD",
+            },
+            "budgetComparison": {
+                "amount": 800.0,
+                "currency": "INR",
+                "exchangeRate": 80.0,
+                "exchangeRateBase": "USD",
+                "exchangeRateQuote": "INR",
+                "exchangeRateDate": "2026-11-10",
+            },
+        }
+        product_snapshot = {
+            "id": 1,
+            "title": "Laptop Pro",
+            "brand": "Example",
+            "category": "laptops",
+            "price": 10.0,
+            "thumbnail": "https://images.example.test/laptop.png",
+        }
+        with database.connect() as connection:
+            connection.execute(
+                "UPDATE orders SET intent_json = ?, cart_json = ?, checks_json = ? WHERE id = ?",
+                (
+                    json.dumps(intent),
+                    json.dumps([{"product": product_snapshot, "quantity": 1}]),
+                    json.dumps(checks),
+                    self.order_id,
+                ),
+            )
+
+        details = self.client.get(
+            f"/api/transactions/{transaction_id}",
+            headers=self.headers,
+        )
+        another_users_details = self.client.get(
+            f"/api/transactions/{transaction_id}",
+            headers=self.other_buyer_headers,
+        )
+
+        self.assertEqual(details.status_code, 200)
+        payload = details.json()
+        self.assertEqual(payload["transaction"]["paypal_capture_id"], "PAYPAL-CAPTURE-TEST")
+        self.assertEqual(payload["transaction"]["paypal_order_id"], self.paypal_order_id)
+        self.assertEqual(payload["transaction"]["capture_status"], "COMPLETED")
+        self.assertEqual(payload["transaction"]["amount"], 10.0)
+        self.assertEqual(payload["transaction"]["currency"], "USD")
+        self.assertIsNone(payload["transaction"]["payer"])
+        self.assertEqual(payload["order"]["intent"]["request"], intent["request"])
+        self.assertEqual(payload["order"]["products"][0]["product"], product_snapshot)
+        self.assertEqual(payload["order"]["products"][0]["subtotal"], 10.0)
+        self.assertEqual(payload["order"]["products"][0]["quantity"], 1)
+        self.assertEqual(payload["order"]["products"][0]["product"]["title"], "Laptop Pro")
+        self.assertEqual(payload["order"]["products"][0]["product"]["brand"], "Example")
+        self.assertEqual(payload["order"]["products"][0]["product"]["category"], "laptops")
+        self.assertEqual(
+            payload["order"]["products"][0]["marketplace"],
+            "DummyJSON Demo Store",
+        )
+        self.assertEqual(payload["order"]["verification"]["status"], checks["status"])
+        self.assertEqual(
+            payload["order"]["verification"]["checks"][0]["reason"],
+            checks["checks"][0]["reason"],
+        )
+        self.assertEqual(
+            payload["order"]["verification"]["checks"][0]["status"],
+            checks["checks"][0]["status"],
+        )
+        self.assertEqual(payload["order"]["budget"]["currency"], "INR")
+        self.assertEqual(payload["order"]["budget"]["actual_total"], 800.0)
+        self.assertEqual(payload["order"]["budget"]["remaining"], 200.0)
+        self.assertEqual(payload["order"]["budget"]["status"], "Within budget")
+        self.assertEqual(another_users_details.status_code, 404)
+
+        with database.connect() as connection:
+            connection.execute(
+                "UPDATE orders SET checks_json = NULL WHERE id = ?", (self.order_id,)
+            )
+        missing_verification = self.client.get(
+            f"/api/transactions/{transaction_id}",
+            headers=self.headers,
+        )
+        self.assertIsNone(missing_verification.json()["order"]["verification"])
+        self.assertEqual(
+            missing_verification.json()["order"]["budget"]["maximum"], 1000.0
+        )
+        self.assertIsNone(
+            missing_verification.json()["order"]["budget"]["actual_total"]
+        )
+        self.assertEqual(
+            missing_verification.json()["order"]["budget"]["status"], "Not available"
+        )
+
+    def test_failed_or_missing_transactions_have_no_success_receipt(self) -> None:
+        missing = self.client.get(
+            "/api/transactions/unknown-transaction",
+            headers=self.headers,
+        )
+        with database.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO transactions
+                (id, user_id, order_id, product, amount, currency, date, method, status, verification)
+                VALUES ('failed-transaction', 1, ?, 'Test item', 10, 'USD', ?, 'PayPal Sandbox', 'Failed', 'Not verified')
+                """,
+                (self.order_id, main.utc_now()),
+            )
+        failed = self.client.get(
+            "/api/transactions/failed-transaction",
+            headers=self.headers,
+        )
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(failed.status_code, 404)
+
     def test_capture_preserves_a_cart_changed_during_paypal_checkout(self) -> None:
         with database.connect() as connection:
             connection.execute("DELETE FROM cart_items WHERE user_id = 1")
@@ -345,6 +496,15 @@ class PayPalCaptureTests(unittest.TestCase):
         self.assertEqual(retry.json()["approval_url"], response.json()["approval_url"])
         self.assertEqual(paypal_request.await_count, 1)
         self.assertEqual(paypal_request.await_args.kwargs["request_id"], main.payment_request_id("create", self.order_id))
+        payment_payload = paypal_request.await_args.kwargs["payload"]
+        self.assertEqual(
+            payment_payload["application_context"]["return_url"],
+            f"{main.FRONTEND_BASE_URL}/payment?order_id={self.order_id}",
+        )
+        self.assertEqual(
+            payment_payload["application_context"]["cancel_url"],
+            f"{main.FRONTEND_BASE_URL}/payment?cancelled=1&order_id={self.order_id}",
+        )
         with database.connect() as connection:
             self.assertEqual(
                 connection.execute(

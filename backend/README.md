@@ -42,6 +42,9 @@ Configure backend values in `backend\.env`. Do not put PayPal secrets in the fro
 - `TRUSTPAY_DATABASE_PATH` — SQLite file path; defaults to `backend\trustpay.db`.
 - `TRUSTPAY_CORS_ORIGINS` — comma-separated trusted frontend origins.
 - `DUMMYJSON_BASE_URL` — public catalogue service base URL.
+- `GEMINI_API_KEY` — optional Google Gemini API key used only by the backend to interpret recommendation requests. Leave blank to use deterministic request parsing.
+- `GEMINI_MODEL` — Gemini model name; defaults to `gemini-3.8-flash`.
+- `GEMINI_TIMEOUT_SECONDS` — Gemini request timeout from 1 to 30 seconds; defaults to 8.
 - `PAYPAL_CLIENT_ID` / `PAYPAL_CLIENT_SECRET` — optional PayPal Sandbox credentials. Checkout stays unavailable until these are configured.
 - `PAYPAL_API_BASE_URL` — defaults to the PayPal Sandbox API.
 - `FRONTEND_BASE_URL` — frontend URL for PayPal return and cancellation.
@@ -98,7 +101,9 @@ backend-only credentials are configured. Never use storefront scraping as a subs
 
 The backend implements JWT register/login/current-user endpoints, supported platform discovery, natural-language policy extraction, product listing/categories/details, recommendation analysis, per-user cart persistence, versioned orders, server-side IntentLock checks and approval, optional PayPal Sandbox create/capture, transactions, dashboard counters, and a SHA-256 linked audit log with integrity verification.
 
-Recommendation searches retrieve all DummyJSON product pages, normalize supported category aliases, and filter for category, brand, model/name terms, mandatory structured specifications, exclusions, and currency-aware budgets before ranking. Category words are checked against category metadata rather than required as literal title terms. Missing catalogue evidence does not count as a match, catalogue retrieval failures remain API errors, and no unrelated-category fallback is returned. Request parsing is deterministic; it does not independently authenticate catalogue claims.
+Recommendation searches first ask Gemini for structured category, product type, brand preferences, attributes, and provider search terms when a backend key is configured. Those terms are sent to the existing DummyJSON product search API; an empty search falls back to retrieving the full real catalogue. Gemini never supplies product listings. Only provider-returned products are filtered and ranked, with category, explicitly requested brand, mandatory structured specifications, exclusions, and currency-aware budgets kept as backend checks. Search wording such as “good” is a relevance signal rather than a mandatory literal title match. Gemini timeouts, quota/network errors, or invalid responses fall back to deterministic parsing. Without a Gemini key, deterministic category parsing and provider search remain available.
+
+Amazon, Flipkart, and Myntra remain unsupported and are rejected by recommendation searches. The only configured source is the explicitly labelled DummyJSON Demo Store. Set the Gemini variables in `backend\.env` (copied from `.env.example`) and restart FastAPI to enable Gemini interpretation. Never put the key in the frontend or commit `backend\.env`.
 
 Verification deliberately reports specifications as needing review and seller status as unverified when the product catalogue does not provide those facts. The demonstration uses SQLite and estimated shipping/tax rates; it is not production-ready financial infrastructure.
 

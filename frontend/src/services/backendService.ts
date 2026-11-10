@@ -8,6 +8,7 @@ import type {
   ProductApiListResponse,
   ProductRecommendation,
   PurchaseIntent,
+  TransactionDetails,
   Transaction,
 } from '../types'
 
@@ -161,6 +162,13 @@ export async function getTransactions(): Promise<Transaction[]> {
     ...transaction,
     orderId: transaction.order_id,
   }))
+}
+
+export async function getTransactionDetails(transactionId: string): Promise<TransactionDetails> {
+  const response = await api.get<TransactionDetails>(
+    `/transactions/${encodeURIComponent(transactionId)}`,
+  )
+  return response.data
 }
 
 export async function getAuditEvents(): Promise<AuditEvent[]> {

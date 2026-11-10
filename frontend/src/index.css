@@ -495,8 +495,54 @@ td small { display: block; margin-top: 4px; color: #9ba4b4; font-size: 8px; }
 .transaction-id small { color: #929dae; font-size: 7px; letter-spacing: .7px; }
 .transaction-id b { color: #3a4660; font-size: 12px; }
 .payment-result .sandbox-disclaimer { margin: 14px 0 0; }
+.receipt-page { display: grid; width: min(100%, 760px); gap: 14px; margin: 8px auto 24px; }
+.receipt-confirmation { display: grid; justify-items: center; align-content: center; min-height: 220px; padding: 22px; border: 1px solid #e7edf1; border-radius: 12px; background: #fff; box-shadow: 0 8px 26px rgba(27, 44, 91, .055); text-align: center; }
+.receipt-confirmation .result-icon { width: 58px; height: 58px; margin-bottom: 5px; }
+.receipt-confirmation h1 { margin: 7px 0 4px; color: var(--navy); font-size: clamp(22px, 3vw, 27px); font-weight: 730; letter-spacing: -.5px; }
+.receipt-confirmation > p { max-width: 100%; margin: 0; color: #718097; font-size: 13px; line-height: 1.6; }
+.receipt-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 16px; }
+.receipt-actions .btn { min-height: 38px; font-size: 11px; }
+.receipt-section { padding: 18px; }
+.receipt-summary-card { width: 100%; margin: 0; padding: 22px; border: 1px solid #e7ebf3; border-radius: 12px; background: #fff; box-shadow: 0 8px 26px rgba(27, 44, 91, .055); }
+.receipt-summary-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 24px; margin: 0; }
+.receipt-summary-list > div { display: flex; min-width: 0; min-height: 58px; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 4px; border-bottom: 1px solid #edf0f5; }
+.receipt-summary-list dt { flex: 0 0 40%; color: #78859b; font-size: 11px; font-weight: 520; }
+.receipt-summary-list dd { min-width: 0; margin: 0; color: #35425b; font-size: 11px; font-weight: 650; line-height: 1.45; text-align: right; overflow-wrap: anywhere; }
+.receipt-summary-list .receipt-marketplace { grid-column: 1 / -1; }
+.receipt-summary-list .receipt-total-paid { grid-column: 1 / -1; min-height: 66px; align-items: center; margin-top: 12px; padding: 14px 16px; border: 1px solid #e1e9ff; border-radius: 9px; background: #f3f6ff; }
+.receipt-total-paid dt { color: #34425d; font-size: 12px; font-weight: 700; }
+.receipt-total-paid dd { color: #3158d8; font-size: 20px; font-weight: 750; letter-spacing: -.3px; white-space: nowrap; }
+.receipt-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.receipt-fields > div { display: grid; min-width: 0; gap: 5px; padding: 10px; border-radius: 6px; background: #f7f9fc; }
+.receipt-fields small { color: #818da3; font-size: 8px; }
+.receipt-fields b { overflow-wrap: anywhere; color: #39465f; font-size: 10px; font-weight: 620; }
+.receipt-product { display: grid; grid-template-columns: 58px minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid #edf0f5; }
+.receipt-product > img, .receipt-image-placeholder { width: 58px; height: 58px; border-radius: 6px; object-fit: cover; background: #f4f6fa; }
+.receipt-image-placeholder { display: grid; place-items: center; color: #818da3; text-align: center; font-size: 7px; }
+.receipt-product-copy { min-width: 0; }
+.receipt-product-copy h3 { margin: 0 0 5px; color: #35425b; font-size: 11px; }
+.receipt-product-copy p { margin: 3px 0; color: #78859b; font-size: 9px; }
+.receipt-product-copy a { color: #416cff; font-size: 9px; }
+.receipt-product > strong { color: #34425d; font-size: 10px; }
+.receipt-request { margin: 0 0 12px; padding: 12px; border-left: 3px solid #8da3f8; background: #f6f8ff; color: #55637c; font-size: 10px; line-height: 1.6; }
+.receipt-check-list { display: grid; gap: 8px; }
+.receipt-check { padding: 11px; border: 1px solid #edf0f5; border-radius: 6px; }
+.receipt-check-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #39465f; font-size: 10px; }
+.receipt-check > p { margin: 8px 0; color: #758199; font-size: 9px; line-height: 1.6; }
+.receipt-check-values { display: grid; gap: 4px; color: #8a95a7; font-size: 8px; overflow-wrap: anywhere; }
+.receipt-loading { display: flex; align-items: center; gap: 8px; margin: 12px; color: #758199; font-size: 10px; }
+.status-neutral { color: #748198; background: #f0f3f8; }
+.status-neutral i { background: currentColor; }
+.receipt-section .summary-row { font-size: 10px; }
+.receipt-section .total-row { border-top: 1px solid #edf0f5; }
 .spinner { width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+@media print {
+  .no-print, .sidebar, .topbar, .toast-viewport { display: none !important; }
+  body, .app-main, .app-content { background: #fff !important; }
+  .receipt-page { gap: 8px; }
+  .receipt-section, .receipt-confirmation { break-inside: avoid; box-shadow: none !important; }
+}
 
 /* Transaction and audit */
 .transactions-panel { padding: 15px; }
@@ -683,4 +729,17 @@ td small { display: block; margin-top: 4px; color: #9ba4b4; font-size: 8px; }
   .hash-grid > div { grid-template-columns: 100px 1fr; align-items: center; }
   .audit-event-heading { align-items: flex-start; }
   .payment-result { margin-top: 30px; padding: 30px 18px; }
+  .receipt-section { padding: 13px; }
+  .receipt-page { width: 100%; gap: 10px; margin: 0 auto 16px; }
+  .receipt-confirmation { min-height: 0; padding: 22px 15px; border-radius: 10px; }
+  .receipt-confirmation > p { font-size: 12px; }
+  .receipt-summary-card { padding: 12px 15px; border-radius: 10px; }
+  .receipt-summary-list { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .receipt-summary-list > div { min-height: 54px; }
+  .receipt-summary-list .receipt-total-paid { grid-column: auto; }
+  .receipt-total-paid dd { font-size: 18px; }
+  .receipt-fields { grid-template-columns: 1fr; }
+  .receipt-product { grid-template-columns: 45px minmax(0, 1fr); gap: 9px; }
+  .receipt-product > img, .receipt-image-placeholder { width: 45px; height: 45px; }
+  .receipt-product > strong { grid-column: 2; }
 }

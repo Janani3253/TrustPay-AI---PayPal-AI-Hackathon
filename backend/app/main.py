@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -21,7 +22,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
+logger = logging.getLogger(__name__)
+
 from .database import connect, initialize_database
+from .gemini import interpret_product_request
 from .schemas import (
     ApprovalRequest,
     AuthResponse,
@@ -199,7 +203,53 @@ async def dummyjson_get(path: str, params: dict[str, Any] | None = None) -> Any:
         ) from error
 
 
-async def _fetch_catalogue_products() -> list[dict[str, Any]]:
+async def _fetch_catalogue_products(
+    search_terms: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    if search_terms:
+        searched_products: list[dict[str, Any]] = []
+        seen_ids: set[Any] = set()
+        searched_terms: set[str] = set()
+        for term in search_terms:
+            query = re.sub(r"\s+", " ", str(term)).strip()[:120]
+            normalized_query = query.casefold()
+            if not query or normalized_query in searched_terms:
+                continue
+            searched_terms.add(normalized_query)
+            if len(searched_terms) > 3:
+                break
+            try:
+                result = await dummyjson_get(
+                    "/products/search",
+                    {"q": query, "limit": 100},
+                )
+            except HTTPException as error:
+                if error.status_code != status.HTTP_502_BAD_GATEWAY:
+                    raise
+                logger.warning(
+                    "Product provider search failed; falling back to catalogue listing."
+                )
+                break
+            if not isinstance(result, dict) or not isinstance(result.get("products"), list):
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="The product catalogue returned an invalid search result.",
+                )
+            if any(not isinstance(product, dict) for product in result["products"]):
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="The product catalogue returned an invalid product record.",
+                )
+            for product in result["products"]:
+                product_id = product.get("id")
+                if product_id is not None and product_id in seen_ids:
+                    continue
+                if product_id is not None:
+                    seen_ids.add(product_id)
+                searched_products.append(product)
+        if searched_products:
+            return searched_products
+
     page_size = 100
     result = await dummyjson_get("/products", {"limit": page_size, "skip": 0})
     if not isinstance(result, dict) or not isinstance(result.get("products"), list):
@@ -392,6 +442,7 @@ _REQUEST_STOP_WORDS = {
     "quantity", "qty", "units", "unit", "pieces", "piece", "pairs", "pair",
     "trusted", "seller", "sellers", "accessory", "accessories",
     "usd", "inr", "rupee", "rupees", "dollar", "dollars", "rs",
+    "good", "great", "best", "quality", "suitable", "recommend", "suggest",
 }
 _KNOWN_BRANDS = (
     "samsung", "apple", "dell", "hp", "lenovo", "xiaomi", "redmi",
@@ -415,13 +466,21 @@ _CATEGORY_PATTERNS = (
     (r"\b(headphones?|earphones?|headsets?)\b", "headphones", "headphone"),
     (r"\bwatches?\b", "watches", "watch"),
     (r"\b(shoes?|sneakers?|trainers?)\b", "shoes", "shoe"),
+    (r"\bfootwear\b", "shoes", "footwear"),
+    (r"\b(pens?|stationery)\b", "stationery", "pen"),
+    (r"\bbooks?\b", "books", "book"),
+    (r"\b(bags?|backpacks?)\b", "bags", "bag"),
+    (r"\b(clothes|clothing|apparel|garments?)\b", "clothing", "clothing"),
+    (r"\b(sports?|athletic)\b", "sports", "sports"),
     (r"\bshirts?\b", "mens-shirts", "shirt"),
     (r"\bdresses?\b", "womens-dresses", "dress"),
     (r"\btables?\b", "furniture", "table"),
     (r"\bchairs?\b", "furniture", "chair"),
     (r"\bfurniture\b", "furniture", "furniture"),
+    (r"\b(?:home )?appliances?\b", "appliances", "appliance"),
     (r"\b(?:refrigerators?|fridges?)\b", "appliances", "refrigerator"),
     (r"\bwashing machines?\b", "appliances", "washing machine"),
+    (r"\b(?:microwaves?|air conditioners?|fans?)\b", "appliances", "appliance"),
 )
 _CATEGORY_ALIASES = {
     "smartphones": {"phone", "mobile", "smartphone", "android", "iphone"},
@@ -430,7 +489,7 @@ _CATEGORY_ALIASES = {
     "televisions": {"tv", "television"},
     "headphones": {"headphone", "earphone", "headset"},
     "audio": {"audio"},
-    "shoes": {"shoe", "sneaker", "trainer"},
+    "shoes": {"shoe", "sneaker", "trainer", "footwear"},
     "watches": {"watch", "smartwatch"},
     "shirts": {"shirt", "tshirt"},
     "dresses": {"dress"},
@@ -440,6 +499,11 @@ _CATEGORY_ALIASES = {
     "appliances": {"appliance"},
     "refrigerators": {"refrigerator", "fridge"},
     "washing-machines": {"washer", "washing machine"},
+    "stationery": {"pen", "pencil", "stationery", "writing instrument"},
+    "books": {"book"},
+    "bags": {"bag", "backpack", "handbag"},
+    "clothing": {"clothing", "clothes", "apparel", "garment"},
+    "sports": {"sport", "sports", "athletic"},
 }
 _SPECIFICATION_PATTERNS = (
     (r"(?P<value>\d+(?:\.\d+)?\s?(?:gb|tb))\s?ram\b", "RAM"),
@@ -455,6 +519,8 @@ def _normalized_tokens(value: Any) -> set[str]:
     for token in re.findall(r"[a-z0-9]+", str(value).lower()):
         if len(token) > 1 and token.endswith("ies"):
             token = token[:-3] + "y"
+        elif len(token) > 4 and token.endswith(("ches", "shes", "xes", "zes", "sses")):
+            token = token[:-2]
         elif len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
             token = token[:-1]
         tokens.add(token)
@@ -583,11 +649,14 @@ def _mandatory_query_text(text: str) -> str:
 
 def _category_families(value: str) -> set[str]:
     tokens = _normalized_tokens(value)
-    return {
+    families = {
         family
         for family, aliases in _CATEGORY_ALIASES.items()
         if any(_normalized_tokens(alias).issubset(tokens) for alias in aliases)
     }
+    if "accessory" in tokens:
+        families.discard("smartphones")
+    return families
 
 
 def _category_vocabulary(category: str, category_terms: list[str]) -> set[str]:
@@ -829,12 +898,22 @@ def _category_matches_product(
     ) if category_terms else set()
     if not requested_families:
         requested_families = _category_families(category)
+    if "clothing" in requested_families:
+        requested_families.update({"shirts", "dresses"})
 
     product_families = _category_families(product_category)
     if product_families.intersection({"furniture", "appliances", "audio"}):
         product_families.update(_category_families(product_evidence))
     if requested_families:
         return bool(requested_families.intersection(product_families))
+    requested_tokens = set().union(
+        *(_normalized_tokens(value) for value in [category, *category_terms])
+    )
+    product_tokens = _normalized_tokens(
+        " ".join((product_category, product_evidence))
+    )
+    if requested_tokens:
+        return bool(requested_tokens.intersection(product_tokens))
     return normalized_product_category == normalized_category
 
 
@@ -944,16 +1023,27 @@ def build_verification(
 ) -> dict[str, Any]:
     totals = cart_price(items)
     requirements = intent.get("requirements", [])
-    category_ok = all(
-        _category_matches_product(
+    requested_category = str(intent.get("category", "")).strip()
+    category_terms = (
+        intent.get("categoryTerms", [])
+        if isinstance(intent.get("categoryTerms", []), list)
+        else []
+    )
+    category_is_explicit = bool(
+        intent.get("categoryIsExplicit", bool(requested_category))
+    )
+    mismatched_products = [
+        item["product"]
+        for item in items
+        if not _category_matches_product(
             str(item["product"].get("category", "")),
-            str(intent.get("category", "")),
-            intent.get("categoryTerms", []) if isinstance(intent.get("categoryTerms", []), list) else [],
-            bool(intent.get("categoryIsExplicit", bool(intent.get("category")))),
+            requested_category,
+            category_terms,
+            category_is_explicit,
             _product_category_evidence(item["product"]),
         )
-        for item in items
-    )
+    ]
+    category_ok = not mismatched_products
     accessory_items = [
         item["product"].get("title", "")
         for item in items
@@ -1005,7 +1095,21 @@ def build_verification(
         {
             "name": "Product type",
             "status": "Passed" if category_ok else "Failed",
-            "reason": "Cart product category matches the purchase policy." if category_ok else "One or more products do not match the requested product category.",
+            "reason": (
+                "Cart product category matches the purchase policy."
+                if category_ok
+                else (
+                    "These cart products do not match the requested category "
+                    f"'{requested_category or 'unspecified'}': "
+                    + "; ".join(
+                        f"'{product.get('title') or 'Untitled product'}' "
+                        f"(catalogue category: "
+                        f"'{product.get('category') or 'not provided'}')"
+                        for product in mismatched_products
+                    )
+                    + ". Remove or replace them, or review the purchase policy."
+                )
+            ),
             "critical": True,
         },
         {
@@ -1780,6 +1884,11 @@ async def recommendations(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A valid shopping request is required.",
         )
+    if intent.get("platformId", "dummyjson") != "dummyjson":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only the DummyJSON Demo Store is supported for product recommendations.",
+        )
 
     raw_category = intent.get("category") or ""
     category_explicit_value = intent.get("categoryIsExplicit")
@@ -1817,6 +1926,7 @@ async def recommendations(
         query,
         re.IGNORECASE,
     ))
+    interpretation = await interpret_product_request(query)
 
     if category_is_explicit and raw_category:
         category = raw_category
@@ -1833,12 +1943,29 @@ async def recommendations(
             category_terms = parsed_request["categoryTerms"]
         else:
             category_terms = []
+        if interpretation:
+            interpretation_families = _category_families(
+                " ".join((interpretation.category, *interpretation.category_terms))
+            )
+            if not raw_category_families or raw_category_families.intersection(interpretation_families):
+                category_terms.extend(interpretation.category_terms)
     else:
-        category = parsed_request["category"] or raw_category
-        category_terms = parsed_request["categoryTerms"] or intent.get("categoryTerms", [])
+        category = (
+            interpretation.category
+            if interpretation and interpretation.category
+            else parsed_request["category"] or raw_category
+        )
+        category_terms = [
+            *parsed_request["categoryTerms"],
+            *(interpretation.category_terms if interpretation else []),
+        ] or intent.get("categoryTerms", [])
     if not isinstance(category_terms, list):
         category_terms = []
-    category_terms = [str(term) for term in category_terms if str(term).strip()]
+    category_terms = list(dict.fromkeys(
+        str(term).strip()
+        for term in category_terms
+        if str(term).strip()
+    ))
 
     client_requirements = intent.get("requirements", [])
     if not isinstance(client_requirements, list):
@@ -1887,6 +2014,14 @@ async def recommendations(
     intent["exclusions"] = exclusions
     if parsed_price_range:
         intent["maximumBudget"] = parsed_request["maximumBudget"]
+    elif (
+        interpretation
+        and interpretation.maximum_budget is not None
+        and re.search(r"\b(?:budget|spend|afford|pay)\b", query, re.IGNORECASE)
+    ):
+        interpreted_budget = Decimal(str(interpretation.maximum_budget))
+        if interpreted_budget.is_finite() and interpreted_budget > 0:
+            intent["maximumBudget"] = float(interpreted_budget)
     if parsed_request["minimumBudget"] is not None:
         intent["minimumBudget"] = parsed_request["minimumBudget"]
     elif "minimumBudget" not in intent:
@@ -1903,13 +2038,34 @@ async def recommendations(
         intent.get("excludeAccessories") or parsed_request["excludeAccessories"]
     )
 
-    products = await _fetch_catalogue_products()
+    interpreted_search_terms = (
+        [
+            interpretation.product_type,
+            *interpretation.search_terms,
+            *(
+                f"{attribute.value} {attribute.name}"
+                for attribute in interpretation.attributes
+            ),
+        ]
+        if interpretation
+        else []
+    )
+    provider_search_terms = interpreted_search_terms or [
+        *category_terms,
+        query,
+    ]
+    products = await _fetch_catalogue_products(provider_search_terms)
     catalogue_brands = {
         str(product.get("brand", "")).strip()
         for product in products
         if isinstance(product, dict) and str(product.get("brand", "")).strip()
     }
     requested_brands = _extract_brands(_mandatory_query_text(query), catalogue_brands)
+    preferred_brands = (
+        interpretation.brand_preferences
+        if interpretation
+        else []
+    )
     mandatory_terms = _mandatory_request_terms(
         query, requirements, category, category_terms
     )
@@ -1989,6 +2145,22 @@ async def recommendations(
             + [str(tag) for tag in tags]
         )
         product_tokens = _normalized_tokens(product_text)
+        interpreted_relevance = 0.0
+        if interpretation:
+            for phrase in (
+                interpretation.product_type,
+                *interpretation.search_terms,
+                *(
+                    f"{attribute.value} {attribute.name}"
+                    for attribute in interpretation.attributes
+                ),
+            ):
+                phrase_tokens = _normalized_tokens(phrase) - _REQUEST_STOP_WORDS
+                if phrase_tokens:
+                    interpreted_relevance = max(
+                        interpreted_relevance,
+                        len(phrase_tokens.intersection(product_tokens)) / len(phrase_tokens),
+                    )
 
         matched_category = _category_matches_product(
             product_category,
@@ -2011,7 +2183,14 @@ async def recommendations(
 
         brand_matched = _product_brand_matches(requested_brands, product)
         keyword_hits = len(keywords.intersection(product_tokens))
-        name_relevance = keyword_hits / len(keywords) if keywords else 0.0
+        name_relevance = max(
+            keyword_hits / len(keywords) if keywords else 0.0,
+            interpreted_relevance,
+        )
+        preferred_brand_matched = any(
+            _product_brand_matches([brand], product) is True
+            for brand in preferred_brands
+        )
 
         try:
             price_decimal = Decimal(str(product["price"]))
@@ -2110,9 +2289,6 @@ async def recommendations(
                     for attribute_present, excluded_value_present in exclusion_checks)
         )
         failed_requirements = []
-        missing_terms = mandatory_terms - product_tokens
-        if missing_terms:
-            failed_requirements.extend(sorted(missing_terms))
         if requested_brands and brand_matched is not True:
             failed_requirements.extend(f"brand {brand}" for brand in requested_brands)
         failed_requirements.extend(
@@ -2169,6 +2345,9 @@ async def recommendations(
             ) / len(constraints)
             score_denominator += 10
             score_numerator += 10 * constraint_evidence
+        if preferred_brands:
+            score_denominator += 10
+            score_numerator += 10 if preferred_brand_matched else 0
         percentage = round(score_numerator / score_denominator * 100)
 
         requested_name_matched = bool(mandatory_terms) and mandatory_terms.issubset(product_tokens)
@@ -2189,7 +2368,11 @@ async def recommendations(
             and budget_eligible
             and currency_verified
         )
-        relevant = name_relevance > 0 or brand_matched is True
+        relevant = (
+            name_relevance > 0
+            or brand_matched is True
+            or preferred_brand_matched
+        )
         match_type = (
             "Exact Match" if exact_match
             else "Partial Match" if relevant or matched_category
@@ -2241,6 +2424,7 @@ async def recommendations(
                 "nameMatched": requested_name_matched,
                 "requestedBrand": requested_brands[0] if requested_brands else None,
                 "brandMatched": brand_matched,
+                "preferredBrandMatched": preferred_brand_matched if preferred_brands else None,
                 "brandMatchStatus": (
                     "Matched" if brand_matched is True
                     else "Not matched" if brand_matched is False
@@ -3091,6 +3275,216 @@ def list_transactions(user: dict[str, Any] = Depends(get_current_user)) -> list[
             (user["id"],),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+@app.get("/api/transactions/{transaction_id}")
+def get_transaction_details(
+    transaction_id: str,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    with connect() as connection:
+        transaction = connection.execute(
+            "SELECT * FROM transactions WHERE id = ? AND user_id = ?",
+            (transaction_id, user["id"]),
+        ).fetchone()
+        if transaction is None or transaction["status"] != "Completed":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Completed transaction not found.",
+            )
+        order = connection.execute(
+            "SELECT * FROM orders WHERE id = ? AND user_id = ?",
+            (transaction["order_id"], user["id"]),
+        ).fetchone()
+        if order is None or order["status"] != "completed":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Completed order details not found.",
+            )
+
+    stored_items = json.loads(order["cart_json"])
+    intent = json.loads(order["intent_json"])
+    platform_id = intent.get("platformId")
+    marketplace = (
+        "DummyJSON Demo Store"
+        if platform_id == "dummyjson"
+        else None
+    )
+    products = []
+    for item in stored_items:
+        product = item["product"]
+        quantity = int(item["quantity"])
+        unit_price = float(product["price"])
+        products.append({
+            "product": product,
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "subtotal": round(unit_price * quantity, 2),
+            "provider": product.get("source") or product.get("provider") or "DummyJSON demo catalogue",
+            "marketplace": marketplace,
+            "product_url": product.get("url") if isinstance(product.get("url"), str) else None,
+        })
+
+    verification = json.loads(order["checks_json"]) if order["checks_json"] else None
+    totals = verification.get("totals") if isinstance(verification, dict) else None
+    if not isinstance(totals, dict):
+        totals = cart_price(json.loads(order["cart_json"]))
+    checks = verification.get("checks") if isinstance(verification, dict) else None
+    if not isinstance(checks, list):
+        checks = None
+
+    budget_comparison = (
+        verification.get("budgetComparison")
+        if isinstance(verification, dict)
+        else None
+    )
+    budget = None
+    try:
+        maximum_budget = Decimal(str(intent["maximumBudget"]))
+        comparison_currency = str(
+            (budget_comparison or {}).get("currency") or intent.get("currency") or ""
+        )
+        comparable_value = (budget_comparison or {}).get("amount")
+        comparable_total = (
+            Decimal(str(comparable_value)) if comparable_value is not None else None
+        )
+        if maximum_budget.is_finite() and maximum_budget > 0:
+            within_budget_check = next(
+                (
+                    check for check in checks or []
+                    if isinstance(check, dict) and check.get("name") == "Final price"
+                ),
+                None,
+            )
+            comparison_is_valid = bool(
+                comparable_total is not None
+                and comparable_total.is_finite()
+                and comparison_currency == intent.get("currency")
+            )
+            budget_status = "Not available"
+            remaining = None
+            actual_budget_total = None
+            if comparison_is_valid and comparable_total is not None:
+                actual_budget_total = float(comparable_total)
+                remaining = float(maximum_budget - comparable_total)
+                if comparable_total > maximum_budget:
+                    budget_status = "Over budget"
+                elif within_budget_check and within_budget_check.get("status") == "Passed":
+                    budget_status = "Within budget"
+                else:
+                    budget_status = "Not verified"
+            budget = {
+                "maximum": float(maximum_budget),
+                "currency": str(intent.get("currency") or comparison_currency),
+                "actual_total": actual_budget_total,
+                "remaining": remaining,
+                "status": budget_status,
+                "exchange_rate": (budget_comparison or {}).get("exchangeRate"),
+                "exchange_rate_base": (budget_comparison or {}).get("exchangeRateBase"),
+                "exchange_rate_quote": (budget_comparison or {}).get("exchangeRateQuote"),
+                "exchange_rate_date": (budget_comparison or {}).get("exchangeRateDate"),
+            }
+    except (KeyError, InvalidOperation, TypeError, ValueError):
+        budget = None
+
+    detailed_checks = []
+    if checks is not None:
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            detailed_check = dict(check)
+            name = check.get("name")
+            if name == "Product type":
+                detailed_check["expected"] = intent.get("category") or None
+                detailed_check["actual"] = sorted({
+                    str(item["product"].get("category") or "")
+                    for item in stored_items
+                    if item["product"].get("category")
+                })
+            elif name == "Product specifications":
+                detailed_check["expected"] = intent.get("requirements") or None
+                detailed_check["actual"] = None
+            elif name == "Final price":
+                detailed_check["expected"] = {
+                    "maximum": budget["maximum"],
+                    "currency": budget["currency"],
+                } if budget else None
+                detailed_check["actual"] = {
+                    "amount": budget["actual_total"],
+                    "currency": budget["currency"],
+                } if budget and budget["actual_total"] is not None else None
+            elif name == "Shipping and additional fees":
+                detailed_check["actual"] = {
+                    key: totals.get(key)
+                    for key in ("shipping", "tax", "total", "currency")
+                }
+            detailed_checks.append(detailed_check)
+
+    original_request = str(intent.get("request") or "")
+    requested_brands = _extract_brands(original_request)
+    persisted_check_names = {
+        check.get("name")
+        for check in detailed_checks
+        if isinstance(check, dict)
+    }
+    if "Product matches original request" not in persisted_check_names:
+        detailed_checks.append({
+            "name": "Product matches original request",
+            "status": "Not Checked",
+            "reason": "The persisted IntentLock verification did not record an overall product-to-request check.",
+            "critical": False,
+            "expected": original_request or None,
+            "actual": None,
+        })
+    if "Brand requirement compliance" not in persisted_check_names:
+        product_brands = sorted({
+            str(item["product"].get("brand"))
+            for item in stored_items
+            if item["product"].get("brand")
+        })
+        detailed_checks.append({
+            "name": "Brand requirement compliance",
+            "status": "Not Checked" if requested_brands else "Not Applicable",
+            "reason": (
+                "The persisted IntentLock verification did not separately verify brand compliance."
+                if requested_brands
+                else "No brand preference was identified in the saved request."
+            ),
+            "critical": False,
+            "expected": requested_brands or None,
+            "actual": product_brands or None,
+        })
+
+    return {
+        "transaction": {
+            "id": transaction["id"],
+            "order_id": transaction["order_id"],
+            "reference": transaction["id"],
+            "provider": transaction["method"],
+            "status": transaction["status"],
+            "capture_status": "COMPLETED",
+            "paypal_capture_id": transaction["paypal_reference"],
+            "paypal_order_id": order["paypal_order_id"],
+            "amount": transaction["amount"],
+            "currency": transaction["currency"],
+            "date": transaction["date"],
+            "captured_at": order["updated_at"],
+            "payer": None,
+        },
+        "order": {
+            "id": order["id"],
+            "version": order["version"],
+            "status": order["status"],
+            "intent": intent,
+            "products": products,
+            "totals": totals,
+            "verification": ({
+                **verification,
+                "checks": detailed_checks,
+            } if isinstance(verification, dict) and checks is not None else None),
+            "budget": budget,
+        },
+    }
 
 
 @app.get("/api/dashboard")

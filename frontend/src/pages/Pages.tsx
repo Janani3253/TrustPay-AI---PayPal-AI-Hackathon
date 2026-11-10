@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   ArrowRight, BadgeCheck, Check,
   CheckCircle2, CircleAlert, Clock3,
@@ -16,13 +16,13 @@ import { getProduct, getProductCategories, getProducts, mapProduct, productDataS
 import { calculateCartTotals } from '../services/cartService'
 import { getOrderFingerprint } from '../utils/order'
 import {
-  addCartProduct, approveBackendOrder, createBackendOrder,
+  addCartProduct, approveBackendOrder, createBackendOrder, getTransactionDetails,
   createPayPalOrder, capturePayPalOrder, cancelPayPalOrder, getAuditEvents, getBackendError,
   getDashboardSummary, getPlatforms, removeCartProduct, searchRecommendations,
   updateCartProduct, verifyBackendAudit, verifyBackendOrder,
   type BackendPaymentResult, type ShoppingPlatform,
 } from '../services/backendService'
-import type { AuditEvent, BackendVerificationCheck, Currency, Product, ProductCategory, ProductMatchAnalysis, ProductRecommendation, Transaction } from '../types'
+import type { AuditEvent, BackendVerificationCheck, Currency, Product, ProductCategory, ProductMatchAnalysis, ProductRecommendation, Transaction, TransactionDetails } from '../types'
 
 function PageTitle({ eyebrow, title, description, action }: { eyebrow?: string; title: string; description?: string; action?: ReactNode }) {
   return <div className="page-title-row"><div>{eyebrow && <div className="eyebrow">{eyebrow}</div>}<h1>{title}</h1>{description && <p>{description}</p>}</div>{action}</div>
@@ -357,7 +357,7 @@ export function ProductResultsPage() {
         .catch((cause: unknown) => {
           console.error('Could not fetch intent-matched products.', cause)
           if (active) {
-            setError('Matching products could not be loaded from Demo Product API.')
+            setError(getBackendError(cause, 'The selected product provider could not be reached. Please try again.'))
             setItems([])
             setLoading(false)
           }
@@ -443,7 +443,7 @@ export function ProductResultsPage() {
               <div className="empty-state">
                 <PackageCheck size={30} />
                 <h3>No matching products found</h3>
-                <p>No catalogue products met all mandatory requirements. Your brand, category, specifications, and budget were not relaxed.</p>
+                <p>The selected provider returned no relevant products for this request. Try a broader search or browse the catalogue.</p>
                 <button className="btn btn-outline" onClick={() => navigate('/products')}>Browse products</button>
               </div>
             )}
@@ -476,7 +476,7 @@ export function CartPage() {
 }
 
 export function VerificationPage() {
-  const { cart, intent, backendOrder, backendVerification, setVerified, setBackendOrder, setBackendVerification, replaceCart, notify } = useApp()
+  const { cart, intent, backendOrder, backendVerification, verifiedFingerprint, setVerified, setBackendOrder, setBackendVerification, replaceCart, notify } = useApp()
   const navigate = useNavigate()
   const [working, setWorking] = useState(false)
   const [error, setError] = useState('')
@@ -491,6 +491,13 @@ export function VerificationPage() {
   const failed = checks.filter((check) => check.status === 'Failed').length
   const warnings = checks.filter((check) => check.status === 'Warning').length
   const passed = checks.filter((check) => check.status === 'Verified').length
+  const blockingChecks = backendVerification?.checks.filter((check) => check.critical && check.status === 'Failed') ?? []
+  const currentSnapshotVerified = Boolean(
+    cart.length
+    && backendOrder
+    && backendVerification?.status === 'Passed'
+    && verifiedFingerprint === getOrderFingerprint(cart, intent),
+  )
   const score = Math.max(0, Math.round((passed / checks.length) * 100 - warnings * 3 - failed * 20))
   const criticalFailures = backendVerification?.status !== 'Passed'
   const statusIcon = (status: string) => status === 'Verified' ? <CheckCircle2 size={19} /> : status === 'Warning' ? <CircleAlert size={19} /> : status === 'Pending' ? <Clock3 size={19} /> : <ShieldAlert size={19} />
@@ -499,15 +506,25 @@ export function VerificationPage() {
     setWorking(true)
     setError('')
     try {
-      const order = await createBackendOrder(intent)
-      replaceCart(order.items.map(({ product, quantity }) => ({
+      const currentFingerprint = getOrderFingerprint(cart, intent)
+      const existingOrderCart = backendOrder?.items.map(({ product, quantity }) => ({
         product: mapProduct(product),
         quantity,
-      })))
+      })) ?? []
+      const matchingOrder = backendOrder
+        && getOrderFingerprint(existingOrderCart, backendOrder.intent) === currentFingerprint
+        ? backendOrder
+        : null
+      const order = matchingOrder ?? await createBackendOrder(intent)
+      const verifiedCart = order.items.map(({ product, quantity }) => ({
+        product: mapProduct(product),
+        quantity,
+      }))
+      replaceCart(verifiedCart)
       setBackendOrder(order)
       const result = await verifyBackendOrder(order.id)
       setBackendVerification(result)
-      setVerified(result.status === 'Passed')
+      setVerified(result.status === 'Passed', verifiedCart)
       if (result.status === 'Passed') navigate('/approval')
       else notify('IntentLock found a critical issue. Review the failed checks before continuing.', 'error')
     } catch (cause) {
@@ -518,7 +535,7 @@ export function VerificationPage() {
       setWorking(false)
     }
   }
-  return <><PageTitle eyebrow="PRE-PAYMENT SECURITY" title="IntentLock verification" description="The backend checks this exact cart snapshot against the saved customer policy." />{error && <div className="form-error">{error}</div>}<div className="verification-overview"><div className="score-gauge"><div className="score-number">{checks.length ? score : '—'}<small>{checks.length ? '/100' : ''}</small></div><span>BACKEND CHECK SUMMARY</span><div className="score-track"><i style={{ width: `${checks.length ? score : 0}%` }} /></div></div><div className="overview-copy"><div className={`security-status ${criticalFailures ? 'security-failed' : 'security-verified'}`}><ShieldCheck size={22} />{!backendVerification ? 'Verification required' : criticalFailures ? 'Action required' : 'Backend checks passed'}</div><h2>{!backendVerification ? 'Run the server-side order checks.' : criticalFailures ? 'Resolve critical policy mismatches.' : 'Review the verified order snapshot.'}</h2><p>Unsupported API data remains unavailable and is not treated as verified.</p><div className="check-counts"><span className="count-green"><Check size={14} />{passed} passed</span><span className="count-amber"><CircleAlert size={14} />{warnings} needs review</span><span className="count-red"><X size={14} />{failed} failed</span></div></div><div className="check-summary-box"><span>Server checks</span><b>{checks.length || 8}</b><small>Backend decision</small></div></div><div className="panel checks-panel"><div className="panel-heading"><div><h2>IntentLock checks</h2><p>{backendOrder ? `Order ${backendOrder.id} · version ${backendOrder.version}` : 'Checks are generated by the backend'}</p></div><span className="mock-tag">SERVER VERIFIED</span></div>{checks.length ? checks.map((check) => <div className="verification-check" key={check.title}><span className={`check-status-icon check-${check.status.toLowerCase()}`}>{statusIcon(check.status)}</span><div className="check-copy"><b>{check.title}</b><p>{check.detail}</p></div><span className={`status-chip status-${check.status.toLowerCase()}`}><i />{check.status === 'Warning' ? 'Needs Review' : check.status}</span></div>) : <div className="empty-message">No verification has been run for this cart yet.</div>}</div><div className="untrusted-callout"><span className="untrusted-icon"><ShieldAlert size={19} /></span><div><b>Untrusted product content</b><p>External catalog descriptions cannot override your policy.</p><small>Product descriptions are displayed as text; backend verification does not execute them as instructions.</small></div></div><div className="verify-actions"><Link className="btn btn-outline" to="/cart">Back to cart</Link><button className="btn btn-primary" disabled={cart.length === 0 || !intent || working} onClick={() => void runVerification()}>{working ? <><span className="spinner" /> Verifying on backend…</> : backendVerification ? 'Re-run backend verification' : 'Verify this order'} <ArrowRight size={16} /></button></div>{cart.length === 0 && <div className="info-banner"><CircleAlert size={18} /> Your cart is empty. Add a product before verification.</div>}</>
+  return <><PageTitle eyebrow="PRE-PAYMENT SECURITY" title="IntentLock verification" description="The backend checks this exact cart snapshot against the saved customer policy." />{error && <div className="form-error">{error}</div>}{backendVerification?.status === 'Failed' && <div className="info-banner warning-banner"><CircleAlert size={18} /><span><b>Checkout is blocked by the backend’s mandatory verification decision.</b>{blockingChecks.length ? ` ${blockingChecks.map((check) => `${check.name}: ${check.reason}`).join(' ')}` : ' The order did not pass a required security check.'}</span>{blockingChecks.some((check) => check.name === 'Product type') ? <Link to="/cart">Review cart products</Link> : <Link to="/shopping-request">Review purchase policy</Link>}</div>}<div className="verification-overview"><div className="score-gauge"><div className="score-number">{checks.length ? score : '—'}<small>{checks.length ? '/100' : ''}</small></div><span>BACKEND CHECK SUMMARY</span><div className="score-track"><i style={{ width: `${checks.length ? score : 0}%` }} /></div></div><div className="overview-copy"><div className={`security-status ${criticalFailures ? 'security-failed' : 'security-verified'}`}><ShieldCheck size={22} />{!backendVerification ? 'Verification required' : criticalFailures ? 'Action required' : 'Backend checks passed'}</div><h2>{!backendVerification ? 'Run the server-side order checks.' : criticalFailures ? 'Resolve critical policy mismatches.' : 'Review the verified order snapshot.'}</h2><p>Unsupported API data remains unavailable and is not treated as verified.</p><div className="check-counts"><span className="count-green"><Check size={14} />{passed} passed</span><span className="count-amber"><CircleAlert size={14} />{warnings} needs review</span><span className="count-red"><X size={14} />{failed} failed</span></div></div><div className="check-summary-box"><span>Server checks</span><b>{checks.length || 8}</b><small>Backend decision</small></div></div><div className="panel checks-panel"><div className="panel-heading"><div><h2>IntentLock checks</h2><p>{backendOrder ? `Order ${backendOrder.id} · version ${backendOrder.version}` : 'Checks are generated by the backend'}</p></div><span className="mock-tag">SERVER VERIFIED</span></div>{checks.length ? checks.map((check) => <div className="verification-check" key={check.title}><span className={`check-status-icon check-${check.status.toLowerCase()}`}>{statusIcon(check.status)}</span><div className="check-copy"><b>{check.title}</b><p>{check.detail}</p></div><span className={`status-chip status-${check.status.toLowerCase()}`}><i />{check.status === 'Warning' ? 'Needs Review' : check.status}</span></div>) : <div className="empty-message">No verification has been run for this cart yet.</div>}</div>{currentSnapshotVerified && warnings > 0 && <div className="info-banner warning-banner"><CircleAlert size={18} /><span>Some checks need review, but the backend marked them as non-blocking. Mandatory checks passed; review the warnings before continuing.</span></div>}<div className="untrusted-callout"><span className="untrusted-icon"><ShieldAlert size={19} /></span><div><b>Untrusted product content</b><p>External catalog descriptions cannot override your policy.</p><small>Product descriptions are displayed as text; backend verification does not execute them as instructions.</small></div></div><div className="verify-actions"><Link className="btn btn-outline" to="/cart">Back to cart</Link><div className="approval-actions">{currentSnapshotVerified && <button className="btn btn-outline" onClick={() => void runVerification()} disabled={working}>Re-run backend verification</button>}{currentSnapshotVerified ? <button className="btn btn-primary" onClick={() => navigate('/approval')}>Continue to Order Approval <ArrowRight size={16} /></button> : <button className="btn btn-primary" disabled={cart.length === 0 || !intent || working} onClick={() => void runVerification()}>{working ? <><span className="spinner" /> Verifying on backend…</> : backendVerification ? 'Re-run backend verification' : 'Verify this order'} <ArrowRight size={16} /></button>}</div></div>{cart.length === 0 && <div className="info-banner"><CircleAlert size={18} /> Your cart is empty. Add a product before verification.</div>}</>
 }
 
 export function ApprovalPage() {
@@ -549,6 +566,78 @@ export function ApprovalPage() {
   return <><PageTitle eyebrow="EXPLICIT CUSTOMER AUTHORIZATION" title="Review and approve" description="Approval is recorded by the backend against the exact verified order version." />{(!verified || !backendOrder) && <div className="info-banner warning-banner"><CircleAlert size={18} /><span>The order has not passed backend verification or has changed. Re-run checks before approval.</span><Link to="/verification">Run verification</Link></div>}{approvalError && <div className="form-error">{approvalError}</div>}<div className="approval-security"><ShieldCheck size={19} /><div><b>{currentChecksPass ? 'Current order version verified' : 'Backend verification required'}</b><span>{backendOrder ? `Order version ${backendOrder.version}; changes require new verification and approval.` : 'No backend order snapshot exists.'}</span></div><Link to="/verification">Review checks</Link></div>{blocked ? <div className="panel empty-state"><ShieldAlert size={28} /><h3>Order cannot be approved yet</h3><p>Pass server-side verification before approving.</p><ButtonLink to={cart.length ? '/verification' : '/cart'}>{cart.length ? 'Verify this order' : 'Review cart'}</ButtonLink></div> : <div className="approval-layout"><section className="panel approval-order"><div className="panel-heading"><div><h2>Exact order details</h2><p>Backend order {backendOrder?.id}</p></div><span className="status-chip status-success"><i /> Version {backendOrder?.version} verified</span></div>{cart.map(({ product, quantity }) => <div className="approval-product" key={product.id}><img src={product.image} alt={product.name} /><div><b>{product.name}</b><span>{product.specifications.length ? product.specifications.join(' · ') : 'Specifications: Not available for verification'}</span><small>{quantity} × {formatMoney(product.price, product.currency)} · Seller: Not provided by catalogue</small></div><strong>{formatMoney(product.price * quantity, product.currency)}</strong></div>)}<div className="request-summary"><small>CUSTOMER PURCHASE POLICY</small><p>“{intent?.request ?? 'No purchase policy found.'}”</p></div><div className="summary-row"><span>Estimated shipping and tax</span><b>{display((backendVerification?.totals.shipping ?? totals.shipping) + (backendVerification?.totals.tax ?? totals.tax))}</b></div><div className="summary-row total-row"><b>Final amount</b><strong>{display(backendVerification?.totals.total ?? totals.total)}</strong></div>{intent && <div className="budget-status"><span><CheckCircle2 size={16} /> Customer budget ({intent.currency})</span><b>{formatMoney(intent.maximumBudget, intent.currency)}</b></div>}<div className="approval-check-results"><b>Backend verification results</b>{checks.map((check) => <span key={check.name}>{check.name}: <strong>{check.status}</strong></span>)}</div><label className="approve-checkbox"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>I explicitly approve this exact product, quantity, estimated fees, and total amount.</span></label><div className="approval-actions"><button className="btn btn-outline" onClick={() => { setApproved(false); navigate('/cart') }}>Reject order</button><button className="btn btn-primary" disabled={!confirmed || blocked || approving} onClick={() => void approve()}>{approving ? 'Recording approval…' : 'Approve exact order'} <ArrowRight size={16} /></button></div></section><aside className="approval-aside"><div className="aside-icon"><Fingerprint size={21} /></div><h3>Approval is order-specific</h3><p>The backend rejects payment if this order changes or the approval becomes stale.</p><div className="approval-includes"><b>You're approving</b><span><Check size={14} /> {cart.length} product{cart.length > 1 ? 's' : ''}</span><span><Check size={14} /> {cart.reduce((sum, item) => sum + item.quantity, 0)} unit{cart.reduce((sum, item) => sum + item.quantity, 0) > 1 ? 's' : ''}</span><span><Check size={14} /> {display(backendVerification?.totals.total ?? totals.total)} total</span></div></aside></div>}</>
 }
 
+function PaymentReceipt({ details }: { details: TransactionDetails }) {
+  const { transaction, order } = details
+  const productDetails = order.products.length
+    ? {
+      productNames: order.products.map(({ product }) => product.title || 'Not available').join(', '),
+      quantities: order.products.map(({ product, quantity }) =>
+        order.products.length === 1 ? String(quantity) : `${product.title || 'Product'}: ${quantity}`,
+      ).join('; '),
+      brands: order.products.map(({ product }) => product.brand || 'Not available').join(', '),
+      categories: order.products.map(({ product }) => product.category || 'Not available').join(', '),
+      marketplaces: order.products.map(({ marketplace }) => marketplace || 'Not available').join(', '),
+    }
+    : {
+      productNames: 'Not available',
+      quantities: 'Not available',
+      brands: 'Not available',
+      categories: 'Not available',
+      marketplaces: 'Not available',
+    }
+
+  return <div className="receipt-page">
+    <header className="receipt-confirmation panel">
+      <div className="result-icon success"><CheckCircle2 size={34} /></div>
+      <h1>Payment Successful</h1>
+      <p>PayPal Sandbox payment completed successfully.</p>
+      <div className="receipt-actions no-print">
+        <ButtonLink to="/transactions" variant="btn-outline">Transaction history</ButtonLink>
+      </div>
+    </header>
+    <section className="panel receipt-section receipt-summary-card">
+      <dl className="receipt-summary-list">
+        <div><dt>Product Name</dt><dd>{productDetails.productNames}</dd></div>
+        <div><dt>Quantity</dt><dd>{productDetails.quantities}</dd></div>
+        <div><dt>Brand</dt><dd>{productDetails.brands}</dd></div>
+        <div><dt>Category</dt><dd>{productDetails.categories}</dd></div>
+        <div className="receipt-marketplace"><dt>Marketplace</dt><dd>{productDetails.marketplaces}</dd></div>
+        <div className="receipt-total-paid"><dt>Total Amount Paid</dt><dd>{formatMoney(transaction.amount, transaction.currency)}</dd></div>
+      </dl>
+    </section>
+  </div>
+}
+
+export function TransactionReceiptPage() {
+  const { transactionId = '' } = useParams()
+  const [details, setDetails] = useState<TransactionDetails | null>(null)
+  const [loadedFor, setLoadedFor] = useState('')
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let active = true
+    getTransactionDetails(transactionId)
+      .then((result) => {
+        if (active) {
+          setDetails(result)
+          setError('')
+          setLoadedFor(transactionId)
+        }
+      })
+      .catch((cause: unknown) => {
+        if (active) {
+          setError(getBackendError(cause, 'Transaction receipt could not be loaded.'))
+          setLoadedFor(transactionId)
+        }
+      })
+    return () => { active = false }
+  }, [transactionId])
+
+  if (loadedFor !== transactionId) return <div className="panel api-state"><span className="spinner" /><p>Loading persisted transaction receipt…</p></div>
+  if (error || !details) return <div className="panel empty-state"><CircleAlert size={28} /><h2>Receipt unavailable</h2><p>{error || 'No completed transaction receipt is available.'}</p><ButtonLink to="/transactions">Back to transaction history</ButtonLink></div>
+  return <PaymentReceipt details={details} />
+}
+
 export function PaymentPage() {
   const { cart, intent, backendOrder, backendVerification, approved, verified, verifiedFingerprint, addTransaction, clearCart, notify } = useApp()
   const [searchParams] = useSearchParams()
@@ -560,6 +649,9 @@ export function PaymentPage() {
     status: string
     paypalOrderId: string | null
   } | null>(null)
+  const [receiptDetails, setReceiptDetails] = useState<TransactionDetails | null>(null)
+  const [receiptLoading, setReceiptLoading] = useState(false)
+  const [receiptError, setReceiptError] = useState('')
   const [paymentError, setPaymentError] = useState('')
   const returnHandled = useRef(false)
   const totals = calculateCartTotals(cart)
@@ -593,6 +685,20 @@ export function PaymentPage() {
         verification: 'Backend verified',
       }
       addTransaction(transaction)
+      setReceiptDetails(null)
+      setReceiptError('')
+      if (result.id) {
+        setReceiptLoading(true)
+        try {
+          setReceiptDetails(await getTransactionDetails(result.id))
+        } catch (cause) {
+          setReceiptError(getBackendError(cause, 'Payment was confirmed, but the persisted receipt could not be loaded.'))
+        } finally {
+          setReceiptLoading(false)
+        }
+      } else {
+        setReceiptError('Payment was confirmed, but the backend did not return a transaction reference for the receipt.')
+      }
       if (result.cart_cleared) clearCart()
       notify(
         result.cart_cleared
@@ -607,7 +713,9 @@ export function PaymentPage() {
     }
   }, [addTransaction, cart, clearCart, notify])
   const paymentResultHandler = useRef(handlePaymentResult)
-  paymentResultHandler.current = handlePaymentResult
+  useEffect(() => {
+    paymentResultHandler.current = handlePaymentResult
+  }, [handlePaymentResult])
 
   useEffect(() => {
     if (returnHandled.current) return
@@ -637,7 +745,7 @@ export function PaymentPage() {
       })
       .finally(() => { if (active) setProcessing(false) })
     return () => { active = false; returnHandled.current = false }
-  }, [searchParams])
+  }, [searchParams, notify])
 
   useEffect(() => {
     if (!processing || payment || paymentError) return
@@ -688,6 +796,26 @@ export function PaymentPage() {
     } finally { setProcessing(false) }
   }
   if (processing && !payment && !paymentError) return <div className="panel api-state"><span className="spinner" /><p>Checking PayPal Sandbox with the backend…</p></div>
+  if (payment?.status === 'COMPLETED') {
+    if (receiptDetails) return <PaymentReceipt details={receiptDetails} />
+    return <div className="panel payment-result">
+      <div className="result-icon success"><CheckCircle2 size={34} /></div>
+      <span className="eyebrow">PAYPAL SANDBOX · BACKEND CONFIRMED</span>
+      <h1>Sandbox payment completed</h1>
+      <p>PayPal confirmed the capture. IntentLock details are retrieved separately from the persisted order.</p>
+      {receiptLoading && <div className="receipt-loading"><span className="spinner" /> Loading persisted receipt…</div>}
+      {receiptError && <div className="form-error">{receiptError}</div>}
+      {payment.id && <button className="btn btn-primary" onClick={() => {
+        setReceiptLoading(true)
+        setReceiptError('')
+        void getTransactionDetails(payment.id)
+          .then(setReceiptDetails)
+          .catch((cause: unknown) => setReceiptError(getBackendError(cause, 'Transaction receipt could not be loaded.')))
+          .finally(() => setReceiptLoading(false))
+      }} disabled={receiptLoading}>{receiptLoading ? 'Loading receipt…' : 'Load transaction receipt'}</button>}
+      <ButtonLink to="/transactions" variant="btn-outline">View transaction history</ButtonLink>
+    </div>
+  }
   if (payment) {
     const completed = payment.status === 'COMPLETED'
     const cancelled = payment.status === 'CANCELLED'
@@ -730,7 +858,7 @@ export function TransactionsPage() {
   const filtered = transactions.filter((item) => (status === 'All statuses' || item.status === status) && (!cutoff || new Date(`${item.date}T00:00:00`) >= cutoff) && `${item.id} ${item.product} ${item.orderId}`.toLowerCase().includes(query.toLowerCase()))
   const pages = Math.max(1, Math.ceil(filtered.length / 5))
   const rows = filtered.slice((page - 1) * 5, page * 5)
-  return <><PageTitle eyebrow="PAYMENT ACTIVITY" title="Transaction history" description="A clear record of every order processed through TrustPay AI." action={<button className="btn btn-outline" onClick={() => window.print()}><Download size={15} /> Export history</button>} /><div className="panel transactions-panel"><div className="transaction-filters"><label className="search-field"><Search size={16} /><input placeholder="Search transactions..." value={query} onChange={(e) => { setQuery(e.target.value); setPage(1) }} /></label><select value={status} onChange={(e) => { setStatus(e.target.value); setPage(1) }}><option>All statuses</option><option>Completed</option><option>Failed</option></select><select className="select-button" aria-label="Date filter" value={dateRange} onChange={(e) => { const range = e.target.value; setDateRange(range); setDateCutoff(range === 'All time' ? null : Date.now() - (range === 'Last 30 days' ? 30 : 90) * 24 * 60 * 60 * 1000); setPage(1) }}><option>All time</option><option>Last 30 days</option><option>Last 90 days</option></select></div><div className="table-scroll"><table><thead><tr><th>TRANSACTION / ORDER</th><th>PRODUCT</th><th>DATE</th><th>METHOD</th><th>AMOUNT</th><th>STATUS</th><th></th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td><b>{row.id}</b><small>{row.orderId}</small></td><td>{row.product}</td><td>{new Date(`${row.date}T12:00:00`).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}</td><td>{row.method}</td><td><b>{formatMoney(row.amount, row.currency)}</b></td><td><span className={`status-chip ${row.status === 'Completed' ? 'status-success' : 'status-danger'}`}><i />{row.status}</span></td><td><button className="icon-btn" onClick={() => setSelected(selected === row.id ? null : row.id)} aria-label={`View ${row.id}`}><Eye size={16} /></button></td></tr>)}</tbody></table></div>{filtered.length === 0 && <div className="empty-message">No matching transactions.</div>}<div className="pagination"><span>Showing {filtered.length ? (page - 1) * 5 + 1 : 0}–{Math.min(page * 5, filtered.length)} of {filtered.length}</span><div><button className="btn btn-outline btn-sm" disabled={page === 1} onClick={() => setPage(page - 1)}>Previous</button><button className="btn btn-outline btn-sm" disabled={page >= pages} onClick={() => setPage(page + 1)}>Next</button></div></div></div>{selected && <div className="info-banner blue-banner"><FileCheck2 size={18} /><span>{selected}: status is {transactions.find((item) => item.id === selected)?.status}; IntentLock verification recorded.</span><button className="icon-btn" onClick={() => setSelected(null)} aria-label="Dismiss"><X size={16} /></button></div>}</>
+  return <><PageTitle eyebrow="PAYMENT ACTIVITY" title="Transaction history" description="A clear record of every order processed through TrustPay AI." action={<button className="btn btn-outline" onClick={() => window.print()}><Download size={15} /> Export history</button>} /><div className="panel transactions-panel"><div className="transaction-filters"><label className="search-field"><Search size={16} /><input placeholder="Search transactions..." value={query} onChange={(e) => { setQuery(e.target.value); setPage(1) }} /></label><select value={status} onChange={(e) => { setStatus(e.target.value); setPage(1) }}><option>All statuses</option><option>Completed</option><option>Failed</option></select><select className="select-button" aria-label="Date filter" value={dateRange} onChange={(e) => { const range = e.target.value; setDateRange(range); setDateCutoff(range === 'All time' ? null : Date.now() - (range === 'Last 30 days' ? 30 : 90) * 24 * 60 * 60 * 1000); setPage(1) }}><option>All time</option><option>Last 30 days</option><option>Last 90 days</option></select></div><div className="table-scroll"><table><thead><tr><th>TRANSACTION / ORDER</th><th>PRODUCT</th><th>DATE</th><th>METHOD</th><th>AMOUNT</th><th>STATUS</th><th></th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td><b>{row.id}</b><small>{row.orderId}</small></td><td>{row.product}</td><td>{new Date(`${row.date}T12:00:00`).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}</td><td>{row.method}</td><td><b>{formatMoney(row.amount, row.currency)}</b></td><td><span className={`status-chip ${row.status === 'Completed' ? 'status-success' : 'status-danger'}`}><i />{row.status}</span></td><td>{row.status === 'Completed' ? <Link className="icon-btn" to={`/transactions/${encodeURIComponent(row.id)}`} aria-label={`View receipt for ${row.id}`}><Eye size={16} /></Link> : <button className="icon-btn" onClick={() => setSelected(selected === row.id ? null : row.id)} aria-label={`View ${row.id}`}><Eye size={16} /></button>}</td></tr>)}</tbody></table></div>{filtered.length === 0 && <div className="empty-message">No matching transactions.</div>}<div className="pagination"><span>Showing {filtered.length ? (page - 1) * 5 + 1 : 0}–{Math.min(page * 5, filtered.length)} of {filtered.length}</span><div><button className="btn btn-outline btn-sm" disabled={page === 1} onClick={() => setPage(page - 1)}>Previous</button><button className="btn btn-outline btn-sm" disabled={page >= pages} onClick={() => setPage(page + 1)}>Next</button></div></div></div>{selected && <div className="info-banner blue-banner"><FileCheck2 size={18} /><span>{selected}: status is {transactions.find((item) => item.id === selected)?.status}; IntentLock verification recorded.</span><button className="icon-btn" onClick={() => setSelected(null)} aria-label="Dismiss"><X size={16} /></button></div>}</>
 }
 
 export function AuditLogPage() {

@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import database, main
+from app.gemini import GeminiProductIntent
 from app.schemas import IntentRequest
 
 
@@ -25,6 +26,13 @@ class RecommendationCurrencyTests(unittest.TestCase):
         self.client = TestClient(main.app)
         self.client.__enter__()
         self.addCleanup(self.cleanup)
+        gemini_patcher = patch.object(
+            main,
+            "interpret_product_request",
+            new=AsyncMock(return_value=None),
+        )
+        gemini_patcher.start()
+        self.addCleanup(gemini_patcher.stop)
 
         with database.connect() as connection:
             connection.execute(
@@ -132,6 +140,375 @@ class RecommendationCurrencyTests(unittest.TestCase):
                 json={"intent": intent},
                 headers=self.headers,
             )
+
+    @staticmethod
+    def interpreted_intent(
+        category: str,
+        category_terms: list[str],
+        product_type: str,
+        search_terms: list[str] | None = None,
+        brand_preferences: list[str] | None = None,
+        attributes: list[dict[str, str]] | None = None,
+        maximum_budget: float | None = None,
+        currency: str | None = None,
+    ) -> GeminiProductIntent:
+        return GeminiProductIntent(
+            category=category,
+            category_terms=category_terms,
+            product_type=product_type,
+            search_terms=search_terms or [],
+            brand_preferences=brand_preferences or [],
+            attributes=attributes or [],
+            maximum_budget=maximum_budget,
+            currency=currency,
+        )
+
+    def search_with_interpretation(
+        self,
+        text: str,
+        products: list[dict[str, object]],
+        interpretation: GeminiProductIntent,
+        budget: float = 1_000,
+        currency: str = "USD",
+    ):
+        intent = main.parse_intent(IntentRequest(
+            request=text,
+            maximumBudget=budget,
+            currency=currency,
+            trustedSellersOnly=False,
+        ))
+        catalogue = AsyncMock(return_value={"products": products})
+        with (
+            patch.object(main, "dummyjson_get", new=catalogue),
+            patch.object(main, "get_exchange_rate", new=AsyncMock(side_effect=self.lookup_rate)),
+            patch.object(main, "interpret_product_request", new=AsyncMock(return_value=interpretation)),
+        ):
+            response = self.client.post(
+                "/api/recommendations/search",
+                json={"intent": intent},
+                headers=self.headers,
+            )
+        return response, catalogue
+
+    @staticmethod
+    def categorized_product(
+        product_id: int,
+        title: str,
+        category: str,
+        brand: str,
+        tags: list[str] | None = None,
+        price: float = 100,
+    ) -> dict[str, object]:
+        return {
+            "id": product_id,
+            "title": title,
+            "description": "",
+            "category": category,
+            "brand": brand,
+            "price": price,
+            "currency": "USD",
+            "tags": tags or [],
+        }
+
+    def test_gemini_iphone_interpretation_prioritizes_iphone_over_other_apple_products(self) -> None:
+        products = [
+            self.categorized_product(201, "Apple Smartphone", "smartphones", "Apple"),
+            self.categorized_product(202, "iPhone 15", "smartphones", "Apple"),
+            self.categorized_product(203, "Apple iPad", "tablets", "Apple"),
+        ]
+        response, _ = self.search_with_interpretation(
+            "I want an iPhone",
+            products,
+            self.interpreted_intent(
+                "smartphones",
+                ["phone", "iphone"],
+                "iPhone",
+                ["iPhone smartphone"],
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        titles = [item["product"]["title"] for item in response.json()["recommendations"]]
+        self.assertEqual(titles[0], "iPhone 15")
+        self.assertNotIn("Apple iPad", titles)
+
+    def test_gemini_shoe_interpretation_returns_footwear_not_stationery(self) -> None:
+        products = [
+            self.categorized_product(211, "Adidas Run Shoe", "mens-shoes", "Adidas", ["running"]),
+            self.categorized_product(212, "Pilot G2 Pen", "stationery", "Pilot", ["writing"]),
+        ]
+        response, catalogue = self.search_with_interpretation(
+            "I need a good running shoe",
+            products,
+            self.interpreted_intent(
+                "footwear",
+                ["shoe", "running shoe"],
+                "running shoe",
+                ["athletic footwear", "sports shoes"],
+                ["Nike", "Adidas"],
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        results = response.json()["recommendations"]
+        self.assertEqual([item["product"]["id"] for item in results], [211])
+        self.assertTrue(any(
+            call.args[0] == "/products/search"
+            and call.args[1]["q"] == "running shoe"
+            for call in catalogue.await_args_list
+        ))
+
+    def test_gemini_pen_interpretation_returns_stationery(self) -> None:
+        products = [
+            self.categorized_product(221, "Pilot G2 Gel Pen", "stationery", "Pilot", ["pen"]),
+            self.categorized_product(222, "Nike Running Shoe", "mens-shoes", "Nike"),
+        ]
+        response, _ = self.search_with_interpretation(
+            "Suggest a good pen for writing",
+            products,
+            self.interpreted_intent(
+                "stationery",
+                ["pen", "writing instrument"],
+                "pen",
+                ["ballpoint pen", "gel pen", "fountain pen"],
+                ["Parker", "Pilot", "Reynolds"],
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [item["product"]["title"] for item in response.json()["recommendations"]],
+            ["Pilot G2 Gel Pen"],
+        )
+
+    def test_gemini_laptop_budget_and_explicit_features_are_enforced(self) -> None:
+        products = [
+            {
+                **self.categorized_product(231, "Lenovo Laptop 16GB RAM", "laptops", "Lenovo", price=500),
+                "specifications": {"RAM": "16GB"},
+            },
+            self.categorized_product(232, "Dell Laptop", "laptops", "Dell", price=700),
+            self.categorized_product(233, "Lenovo Watch", "mens-watches", "Lenovo", price=50),
+        ]
+        response, _ = self.search_with_interpretation(
+            "I need a Lenovo laptop with 16GB RAM under $600",
+            products,
+            self.interpreted_intent(
+                "laptops",
+                ["laptop", "notebook"],
+                "laptop",
+                ["portable computer"],
+                ["Lenovo"],
+                [{"name": "RAM", "value": "16GB"}],
+                600,
+                "USD",
+            ),
+            budget=1,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        results = response.json()["recommendations"]
+        self.assertEqual([item["product"]["id"] for item in results], [231])
+        self.assertTrue(results[0]["analysis"]["budgetMatched"])
+        self.assertTrue(results[0]["analysis"]["brandMatched"])
+
+    def test_gemini_extracts_budget_from_natural_spending_language(self) -> None:
+        products = [
+            self.categorized_product(235, "Affordable Laptop", "laptops", "Acer", price=400),
+            self.categorized_product(236, "Premium Laptop", "laptops", "Acer", price=700),
+        ]
+        response, _ = self.search_with_interpretation(
+            "I can spend 500 on a laptop",
+            products,
+            self.interpreted_intent(
+                "laptops",
+                ["laptop"],
+                "laptop",
+                ["notebook computer"],
+                maximum_budget=500,
+                currency="USD",
+            ),
+            budget=1_000,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        results = response.json()["recommendations"]
+        self.assertEqual([item["product"]["id"] for item in results], [235])
+        self.assertTrue(results[0]["analysis"]["budgetMatched"])
+
+    def test_gemini_watch_interpretation_returns_watches(self) -> None:
+        products = [
+            self.categorized_product(241, "Casio Watch", "mens-watches", "Casio"),
+            self.categorized_product(242, "Parker Pen", "stationery", "Parker"),
+        ]
+        response, _ = self.search_with_interpretation(
+            "Find a watch",
+            products,
+            self.interpreted_intent(
+                "watches",
+                ["watch", "timepiece"],
+                "watch",
+                ["wristwatch", "smartwatch"],
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [item["product"]["title"] for item in response.json()["recommendations"]],
+            ["Casio Watch"],
+        )
+
+    def test_ai_brand_preferences_rank_but_do_not_invent_or_exclude_other_brands(self) -> None:
+        products = [
+            self.categorized_product(251, "Unbranded Trail Shoe", "mens-shoes", "Unbranded"),
+            self.categorized_product(252, "Nike Running Shoe", "mens-shoes", "Nike"),
+        ]
+        response, _ = self.search_with_interpretation(
+            "Find a running shoe",
+            products,
+            self.interpreted_intent(
+                "shoes",
+                ["shoe", "footwear"],
+                "running shoe",
+                ["athletic shoe"],
+                ["Nike", "Adidas"],
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        results = response.json()["recommendations"]
+        self.assertEqual(results[0]["product"]["id"], 252)
+        self.assertEqual({item["product"]["id"] for item in results}, {251, 252})
+
+    def test_unsupported_marketplace_is_rejected_before_provider_search(self) -> None:
+        request = main.parse_intent(IntentRequest(
+            request="Find a laptop",
+            maximumBudget=1_000,
+            currency="USD",
+            trustedSellersOnly=False,
+        ))
+        catalogue = AsyncMock()
+        with (
+            patch.object(main, "dummyjson_get", new=catalogue),
+            patch.object(main, "interpret_product_request", new=AsyncMock(return_value=None)),
+        ):
+            response = self.client.post(
+                "/api/recommendations/search",
+                json={"intent": {**request, "platformId": "Amazon"}},
+                headers=self.headers,
+            )
+
+        self.assertEqual(response.status_code, 400)
+        catalogue.assert_not_awaited()
+
+    def test_empty_provider_results_are_not_replaced_with_fabricated_products(self) -> None:
+        response, _ = self.search_with_interpretation(
+            "Find a fountain pen",
+            [],
+            self.interpreted_intent(
+                "stationery",
+                ["pen"],
+                "fountain pen",
+                ["writing instrument"],
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["recommendations"], [])
+        self.assertEqual(response.json()["total"], 0)
+        self.assertIsNotNone(response.json()["message"])
+
+    def test_real_recommendation_product_can_still_be_added_to_cart(self) -> None:
+        product = self.categorized_product(261, "Pilot G2 Gel Pen", "stationery", "Pilot")
+        recommendations, _ = self.search_with_interpretation(
+            "Find a pen",
+            [product],
+            self.interpreted_intent("stationery", ["pen"], "pen", ["gel pen"]),
+        )
+        self.assertEqual(recommendations.status_code, 200)
+
+        with patch.object(main, "dummyjson_get", new=AsyncMock(return_value=product)):
+            added = self.client.post(
+                "/api/cart/items",
+                json={"product_id": 261, "quantity": 1},
+                headers=self.headers,
+            )
+            cart = self.client.get("/api/cart", headers=self.headers)
+
+        self.assertEqual(added.status_code, 200)
+        self.assertEqual(cart.status_code, 200)
+        self.assertEqual(cart.json()["items"][0]["product"]["title"], "Pilot G2 Gel Pen")
+
+    def test_gemini_failure_uses_deterministic_interpretation(self) -> None:
+        from app import gemini
+
+        shoe = self.categorized_product(144, "Nike Running Shoe", "mens-shoes", "Nike")
+        intent = main.parse_intent(IntentRequest(
+            request="Find a pair of running shoes",
+            maximumBudget=1_000,
+            currency="USD",
+            trustedSellersOnly=False,
+        ))
+        with (
+            patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}),
+            patch.object(gemini, "_generate_content_sync", side_effect=TimeoutError()),
+            patch.object(main, "interpret_product_request", new=gemini.interpret_product_request),
+            patch.object(main, "dummyjson_get", new=AsyncMock(return_value={"products": [shoe]})),
+            patch.object(main, "get_exchange_rate", new=AsyncMock(side_effect=self.lookup_rate)),
+        ):
+            response = self.client.post(
+                "/api/recommendations/search",
+                json={"intent": intent},
+                headers=self.headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [item["product"]["id"] for item in response.json()["recommendations"]],
+            [144],
+        )
+
+    def test_deterministic_fallback_recognizes_shoes_and_pens(self) -> None:
+        shoe_intent = main.parse_intent(IntentRequest(
+            request="Find a pair of running shoes",
+            maximumBudget=1_000,
+            currency="USD",
+            trustedSellersOnly=False,
+        ))
+        pen_intent = main.parse_intent(IntentRequest(
+            request="Find a pen for writing",
+            maximumBudget=100,
+            currency="USD",
+            trustedSellersOnly=False,
+        ))
+        book_intent = main.parse_intent(IntentRequest(
+            request="Find a book",
+            maximumBudget=100,
+            currency="USD",
+            trustedSellersOnly=False,
+        ))
+        appliance_intent = main.parse_intent(IntentRequest(
+            request="Find a home appliance",
+            maximumBudget=1_000,
+            currency="USD",
+            trustedSellersOnly=False,
+        ))
+
+        self.assertEqual(shoe_intent["category"], "shoes")
+        self.assertEqual(pen_intent["category"], "stationery")
+        self.assertEqual(book_intent["category"], "books")
+        self.assertEqual(appliance_intent["category"], "appliances")
+
+    def test_invalid_gemini_response_uses_deterministic_interpretation(self) -> None:
+        from app import gemini
+
+        with (
+            patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}),
+            patch.object(gemini, "_generate_content_sync", return_value="not valid json"),
+        ):
+            interpretation = asyncio.run(gemini.interpret_product_request("Find a pair of shoes"))
+
+        self.assertIsNone(interpretation)
 
     def test_inr_budget_converts_catalogue_prices_and_includes_estimated_fees(self) -> None:
         response = self.search(80_000, "INR")
@@ -821,6 +1198,27 @@ class RecommendationCurrencyTests(unittest.TestCase):
         self.assertFalse(main._category_matches_product(
             "furniture", "furniture", ["table"], True, "Office Chair"
         ))
+        self.assertFalse(main._category_matches_product(
+            "mobile-accessories", "smartphones", ["iphone"], False, "Apple iPhone Case"
+        ))
+        self.assertTrue(main._category_matches_product(
+            "mens-shirts", "clothing", ["clothing"], False, "Cotton Shirt"
+        ))
+        self.assertTrue(main._category_matches_product(
+            "womens-dresses", "clothing", ["clothing"], False, "Casual Dress"
+        ))
+        self.assertTrue(main._category_matches_product(
+            "womens-bags", "bags", ["bag"], False, "Leather Handbag"
+        ))
+        self.assertTrue(main._category_matches_product(
+            "books", "books", ["book"], False, "Cookbook"
+        ))
+        self.assertTrue(main._category_matches_product(
+            "appliances", "appliances", ["appliance"], False, "Kitchen Appliance"
+        ))
+        self.assertTrue(main._category_matches_product(
+            "sports-accessories", "sports", ["sports"], False, "Sports Equipment"
+        ))
 
     def test_catalogue_retrieval_reads_all_pages_and_deduplicates_products(self) -> None:
         catalogue = AsyncMock(side_effect=[
@@ -850,6 +1248,34 @@ class RecommendationCurrencyTests(unittest.TestCase):
                 asyncio.run(main._fetch_catalogue_products())
 
         self.assertEqual(error.exception.status_code, 502)
+
+    def test_provider_search_failure_falls_back_to_real_catalogue(self) -> None:
+        shoe = self.categorized_product(143, "Nike Running Shoe", "mens-shoes", "Nike")
+        intent = main.parse_intent(IntentRequest(
+            request="Find a running shoe",
+            maximumBudget=1_000,
+            currency="USD",
+            trustedSellersOnly=False,
+        ))
+        catalogue = AsyncMock(side_effect=[
+            main.HTTPException(status_code=502, detail="Search unavailable"),
+            {"products": [shoe], "total": 1},
+        ])
+        with (
+            patch.object(main, "dummyjson_get", new=catalogue),
+            patch.object(main, "get_exchange_rate", new=AsyncMock(side_effect=self.lookup_rate)),
+        ):
+            response = self.client.post(
+                "/api/recommendations/search",
+                json={"intent": intent},
+                headers=self.headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [item["product"]["id"] for item in response.json()["recommendations"]],
+            [143],
+        )
 
     def test_brand_can_come_from_title_but_not_conflicting_brand_or_description(self) -> None:
         products = [
@@ -1016,9 +1442,16 @@ class RecommendationCurrencyTests(unittest.TestCase):
         self.assertEqual(response.json()["recommendations"], [])
         self.assertIn("No products matched", response.json()["message"])
 
-    def create_and_verify_order(self, item: dict[str, object], budget: float = 20_000, rate_available: bool = True):
+    def create_and_verify_order(
+        self,
+        item: dict[str, object],
+        budget: float = 20_000,
+        rate_available: bool = True,
+        trusted_sellers_only: bool = False,
+    ):
         items = [{"product": item, "quantity": 1}]
         intent = self.request(budget, "INR")["intent"]
+        intent["trustedSellersOnly"] = trusted_sellers_only
         with patch.object(main, "current_cart", new=AsyncMock(return_value=items)):
             created = self.client.post(
                 "/api/orders",
@@ -1084,6 +1517,60 @@ class RecommendationCurrencyTests(unittest.TestCase):
             )
         self.assertEqual(approval.status_code, 409)
 
+    def test_mandatory_trusted_seller_failure_blocks_approval_and_payment(self) -> None:
+        item = {
+            "id": 3,
+            "title": "iPhone 5s",
+            "category": "smartphones",
+            "price": 199.99,
+        }
+        created, verified = self.create_and_verify_order(
+            item,
+            budget=80_000,
+            trusted_sellers_only=True,
+        )
+
+        self.assertEqual(verified.json()["status"], "Failed")
+        seller_check = next(
+            check for check in verified.json()["checks"]
+            if check["name"] == "Seller requirements"
+        )
+        self.assertEqual(seller_check["status"], "Failed")
+        self.assertTrue(seller_check["critical"])
+        with patch.object(main, "current_cart", new=AsyncMock(return_value=[{"product": item, "quantity": 1}])):
+            approval = self.client.post(
+                f"/api/approvals/{created['id']}/approve",
+                json={"order_version": 1},
+                headers=self.headers,
+            )
+        payment = self.client.post(
+            "/api/payments/create-order",
+            json={"order_id": created["id"]},
+            headers=self.headers,
+        )
+
+        self.assertEqual(approval.status_code, 409)
+        self.assertEqual(payment.status_code, 409)
+
+    def test_category_failure_identifies_mismatched_cart_products(self) -> None:
+        item = {
+            "id": 4,
+            "title": "Laptop Pro",
+            "category": "laptops",
+            "price": 199.99,
+        }
+        _, verified = self.create_and_verify_order(item, budget=80_000)
+
+        self.assertEqual(verified.json()["status"], "Failed")
+        product_check = next(
+            check for check in verified.json()["checks"]
+            if check["name"] == "Product type"
+        )
+        self.assertTrue(product_check["critical"])
+        self.assertIn("Laptop Pro", product_check["reason"])
+        self.assertIn("laptops", product_check["reason"])
+        self.assertIn("smartphones", product_check["reason"])
+
     def test_in_budget_order_can_be_verified_and_explicitly_approved(self) -> None:
         item = {
             "id": 1,
@@ -1095,6 +1582,12 @@ class RecommendationCurrencyTests(unittest.TestCase):
 
         self.assertEqual(verified.json()["status"], "Passed")
         self.assertEqual(verified.json()["budgetComparison"]["amount"], 17_598.4)
+        suspicious_content_check = next(
+            check for check in verified.json()["checks"]
+            if check["name"] == "Suspicious content"
+        )
+        self.assertEqual(suspicious_content_check["status"], "Needs Review")
+        self.assertFalse(suspicious_content_check["critical"])
         with patch.object(main, "current_cart", new=AsyncMock(return_value=[{"product": item, "quantity": 1}])):
             approval = self.client.post(
                 f"/api/approvals/{created['id']}/approve",

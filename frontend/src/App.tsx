@@ -6,7 +6,7 @@ import { useApp } from './context/AppContext'
 import {
   ApprovalPage, AuditLogPage, CartPage, DashboardPage, LandingPage, LoginPage, PlatformSelectionPage,
   PaymentPage, ProductResultsPage, ProductsPage, RegisterPage, RequestPage,
-  TransactionsPage, VerificationPage,
+  TransactionReceiptPage, TransactionsPage, VerificationPage,
 } from './pages/Pages'
 
 function ProtectedLayout() {
@@ -46,6 +46,7 @@ export default function App() {
               <Route path="/payment" element={<PaymentPage />} />
             </Route>
             <Route path="/transactions" element={<TransactionsPage />} />
+            <Route path="/transactions/:transactionId" element={<TransactionReceiptPage />} />
             <Route path="/audit-log" element={<AuditLogPage />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
