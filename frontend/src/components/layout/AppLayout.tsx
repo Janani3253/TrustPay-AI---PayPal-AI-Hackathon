@@ -3,7 +3,7 @@ import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import {
   Activity, Bell, Boxes, ChevronLeft, ChevronRight, CircleAlert, ClipboardCheck,
   FileClock, LayoutDashboard, LogOut, Menu, Search, ShieldCheck, ShoppingBag,
-  ShoppingCart, X,
+  ShoppingCart, WalletCards, X,
 } from 'lucide-react'
 import { Brand } from '../common/Brand'
 import { useApp } from '../../context/AppContext'
@@ -15,6 +15,7 @@ const links = [
   { to: '/shopping-request', label: 'Shopping request', icon: Search },
   { to: '/product-results', label: 'Product results', icon: ShoppingBag },
   { to: '/cart', label: 'Shopping cart', icon: ShoppingCart },
+  { to: '/budget-planner', label: 'Budget Planner', icon: WalletCards },
   { to: '/verification', label: 'IntentLock', icon: ShieldCheck },
   { to: '/approval', label: 'Order approval', icon: ClipboardCheck },
   { to: '/transactions', label: 'Transactions', icon: Activity },

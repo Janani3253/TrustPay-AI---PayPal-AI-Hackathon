@@ -3,6 +3,7 @@ import { AppProvider } from './context/AppContext'
 import { AppLayout } from './components/layout/AppLayout'
 import { ToastViewport } from './components/common/ToastViewport'
 import { useApp } from './context/AppContext'
+import { BudgetPlannerPage } from './pages/BudgetPlannerPage'
 import {
   ApprovalPage, AuditLogPage, CartPage, DashboardPage, LandingPage, LoginPage, PlatformSelectionPage,
   PaymentPage, ProductResultsPage, ProductsPage, RegisterPage, RequestPage,
@@ -47,6 +48,7 @@ export default function App() {
             </Route>
             <Route path="/transactions" element={<TransactionsPage />} />
             <Route path="/transactions/:transactionId" element={<TransactionReceiptPage />} />
+            <Route path="/budget-planner" element={<BudgetPlannerPage />} />
             <Route path="/audit-log" element={<AuditLogPage />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />

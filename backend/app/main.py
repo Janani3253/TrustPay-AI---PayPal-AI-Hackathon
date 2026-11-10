@@ -94,6 +94,32 @@ def json_dump(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def json_load(value: Any, default: Any = None) -> Any:
+    if value is None or value == "":
+        return default
+    if isinstance(value, (dict, list, int, float, bool)):
+        return value
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if not isinstance(value, str):
+        return default
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def row_value(row: Any, key: str, default: Any = None) -> Any:
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        return row[key]
+    except (KeyError, TypeError, IndexError):
+        return default
+
+
 def make_password_hash(password: str) -> str:
     salt = secrets.token_bytes(16)
     derived = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310_000)
@@ -1183,7 +1209,9 @@ def require_order(connection: Any, order_id: str, user_id: int) -> sqlite3.Row:
 
 
 def order_matches_cart(order: Any, items: list[dict[str, Any]]) -> bool:
-    stored = json.loads(order["cart_json"])
+    stored = json_load(row_value(order, "cart_json", default=[]), default=[])
+    if not isinstance(stored, list):
+        return False
     return json_dump(stored) == json_dump(items)
 
 
@@ -1523,7 +1551,9 @@ def audit_paypal_validation_error(user_id: int, order_id: str, error: HTTPExcept
 
 
 def clear_cart_if_matches_order(connection: sqlite3.Connection, order: Any) -> bool:
-    stored_items = json.loads(order["cart_json"])
+    stored_items = json_load(row_value(order, "cart_json", default=[]), default=[])
+    if not isinstance(stored_items, list):
+        return False
     expected = sorted(
         (int(item["product"]["id"]), int(item["quantity"]))
         for item in stored_items
@@ -1598,7 +1628,7 @@ def record_completed_payment(
                 detail="TrustPay order is not eligible for payment completion.",
             )
 
-        stored_items = json.loads(latest_order["cart_json"])
+        stored_items = json_load(row_value(latest_order, "cart_json", default=[]), default=[])
         product_names = ", ".join(
             item["product"].get("title", "Product") for item in stored_items
         )
@@ -1852,6 +1882,11 @@ async def list_products(
 @app.get("/api/products/categories")
 async def list_categories(user: dict[str, Any] = Depends(get_current_user)) -> list[dict[str, Any]]:
     result = await dummyjson_get("/products/categories")
+    if not isinstance(result, list):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="The product catalogue returned an invalid category list.",
+        )
     return [
         {"slug": item, "name": item.replace("-", " ").title(), "url": ""}
         if isinstance(item, str)
