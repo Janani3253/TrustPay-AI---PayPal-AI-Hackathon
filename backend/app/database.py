@@ -88,3 +88,76 @@ def initialize_database() -> None:
             );
             """
         )
+
+        order_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(orders)")
+        }
+        for column in (
+            "paypal_create_request_id",
+            "paypal_capture_request_id",
+            "paypal_capture_id",
+            "paypal_approval_url",
+        ):
+            if column not in order_columns:
+                connection.execute(f"ALTER TABLE orders ADD COLUMN {column} TEXT")
+
+        unique_keys = (
+            ("orders", "paypal_order_id"),
+            ("orders", "paypal_create_request_id"),
+            ("orders", "paypal_capture_request_id"),
+            ("orders", "paypal_capture_id"),
+            ("transactions", "order_id"),
+            ("transactions", "paypal_reference"),
+        )
+        for table, column in unique_keys:
+            duplicate = connection.execute(
+                f"""
+                SELECT 1
+                FROM {table}
+                WHERE {column} IS NOT NULL
+                GROUP BY {column}
+                HAVING COUNT(*) > 1
+                LIMIT 1
+                """
+            ).fetchone()
+            if duplicate:
+                raise RuntimeError(
+                    f"Cannot enforce payment idempotency: duplicate existing values "
+                    f"were found in {table}.{column}. Review the existing records "
+                    "before restarting the backend."
+                )
+
+        connection.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_paypal_order_id
+            ON orders(paypal_order_id)
+            WHERE paypal_order_id IS NOT NULL
+        """)
+
+        connection.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_paypal_create_request_id
+            ON orders(paypal_create_request_id)
+            WHERE paypal_create_request_id IS NOT NULL
+        """)
+
+        connection.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_paypal_capture_request_id
+            ON orders(paypal_capture_request_id)
+            WHERE paypal_capture_request_id IS NOT NULL
+        """)
+
+        connection.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_paypal_capture_id
+            ON orders(paypal_capture_id)
+            WHERE paypal_capture_id IS NOT NULL
+        """)
+
+        connection.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_transactions_order_id
+            ON transactions(order_id)
+        """)
+
+        connection.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_transactions_paypal_reference
+            ON transactions(paypal_reference)
+            WHERE paypal_reference IS NOT NULL
+        """)

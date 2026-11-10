@@ -10,7 +10,7 @@ export function mapProduct(item: ProductApiProduct): Product {
     description: item.description,
     category: item.category,
     price: item.price,
-    currency: 'USD',
+    currency: item.currency ?? 'USD',
     seller: null,
     sellerVerified: false,
     rating: item.rating,

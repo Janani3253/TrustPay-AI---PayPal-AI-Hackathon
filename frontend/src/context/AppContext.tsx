@@ -33,7 +33,7 @@ interface AppContextValue {
   removeFromCart: (productId: string) => void
   setIntent: (intent: PurchaseIntent) => void
   setApproved: (approved: boolean) => void
-  setVerified: (verified: boolean) => void
+  setVerified: (verified: boolean, snapshot?: CartItem[]) => void
   recordAudit: (type: string, description: string) => void
   notify: (message: string, tone?: ToastTone) => void
   dismissToast: (id: string) => void
@@ -127,7 +127,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }
       })
       .catch((error: unknown) => {
-        console.error('Could not restore the backend session.', error)
+        console.error('Could not restore the backend session.', getSanitizedErrorMessage(error))
         if (active) {
           notify(getBackendError(error, 'Could not restore the backend session. Please sign in again.'), 'error')
           clearAuthToken()
@@ -319,9 +319,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
         notify('Exact order approval recorded.')
       }
     },
-    setVerified: (value) => {
-      setVerificationFingerprint(value && cart.length > 0 ? fingerprint : null)
-      if (value && cart.length > 0) setAuditRecords((current) => [...current, {
+    setVerified: (value, snapshot) => {
+      const verifiedCart = snapshot ?? cart
+      const verifiedOrderFingerprint = getOrderFingerprint(verifiedCart, intent)
+      setVerificationFingerprint(value && verifiedCart.length > 0 ? verifiedOrderFingerprint : null)
+      if (value && verifiedCart.length > 0) setAuditRecords((current) => [...current, {
         id: crypto.randomUUID(),
         type: 'IntentLock verification completed',
         timestamp: new Date().toISOString(),
@@ -332,7 +334,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
     recordAudit,
     notify,
     dismissToast,
-    addTransaction: (transaction) => setTransactions((current) => [transaction, ...current]),
+    addTransaction: (transaction) => setTransactions((current) => [
+      transaction,
+      ...current.filter((existing) => existing.id !== transaction.id && existing.orderId !== transaction.orderId),
+    ]),
     clearCart: () => {
       setCart([])
       setCartTotals(null)

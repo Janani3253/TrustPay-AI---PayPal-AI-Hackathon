@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   ArrowRight, BadgeCheck, Check,
   CheckCircle2, CircleAlert, Clock3,
@@ -21,7 +21,7 @@ import {
   getBackendOrder, getCart, getDashboardSummary, getPlatforms, removeCartProduct, reverifyIntentLock,
   scanUntrustedContent, searchRecommendations,
   updateCartProduct, verifyBackendAudit, verifyBackendOrder,
-  type ShoppingPlatform,
+  type BackendPaymentResult, type ShoppingPlatform,
 } from '../services/backendService'
 import type { AuditEvent, BackendVerificationCheck, Currency, Product, ProductCategory, ProductRecommendation, PurchaseIntent, SecurityScanResult, Transaction } from '../types'
 
@@ -31,6 +31,50 @@ function PageTitle({ eyebrow, title, description, action }: { eyebrow?: string; 
 
 function ButtonLink({ to, children, variant = 'primary', icon }: { to: string; children: ReactNode; variant?: string; icon?: ReactNode }) {
   return <Link className={`btn ${variant}`} to={to}>{children}{icon}</Link>
+}
+
+function RecommendationPrice({ analysis }: { analysis: ProductMatchAnalysis }) {
+  const currency = analysis.comparisonCurrency
+  const formatConverted = (amount: number | null | undefined) =>
+    amount == null || !currency ? 'Unavailable' : formatMoney(amount, currency)
+
+  const budgetStatus = analysis.budgetMatched === true
+    ? 'Within budget including estimated fees'
+    : analysis.budgetMatched === false
+      ? 'Budget exceeded including estimated fees'
+      : 'Cannot determine; exchange rate or price is unavailable'
+  const recommendationStatus = analysis.status === 'Exchange Rate Unavailable'
+    ? 'Currency Verification Pending'
+    : analysis.status === 'Budget Exceeded'
+      ? 'Budget Exceeded'
+      : analysis.status === 'Specifications Unverified'
+        ? 'Specifications Unverified'
+        : analysis.matchType ?? analysis.status ?? 'Partial Match'
+
+  return (
+    <div className="match-analysis recommendation-price">
+      <b>{recommendationStatus}</b>
+      <div><span>Original catalogue price</span><em>{analysis.cataloguePrice == null ? 'Unavailable' : formatMoney(analysis.cataloguePrice, analysis.catalogueCurrency ?? 'USD')}</em></div>
+      <div><span>Converted catalogue price</span><em>{formatConverted(analysis.convertedPrice)}</em></div>
+      <div><span>Estimated shipping</span><em>{formatConverted(analysis.convertedShipping)}</em></div>
+      <div><span>Estimated tax</span><em>{formatConverted(analysis.convertedTax)}</em></div>
+      <div><span>Comparable total used for budget check</span><em>{formatConverted(analysis.comparableTotal)}</em></div>
+      <div><span>Budget status</span><em>{budgetStatus}</em></div>
+      <div><span>Brand match {analysis.requestedBrand ? `(${analysis.requestedBrand})` : ''}</span><em>{analysis.brandMatchStatus ?? 'Not available'}</em></div>
+      <div><span>Product-name relevance</span><em>{analysis.nameRelevance == null ? 'Not available' : `${Math.round(analysis.nameRelevance * 100)}%`}</em></div>
+      <div><span>Category match</span><em>{analysis.categoryMatched ? 'Matched' : 'Not matched'}</em></div>
+      {analysis.specificationsMatched !== undefined && analysis.specificationsMatched !== null && (
+        <div><span>Specification evidence</span><em>{analysis.specificationsMatched ? 'Mentioned, not independently verified' : 'Not available for verification'}</em></div>
+      )}
+      <div><span>Verification status</span><em>{analysis.verificationStatus ?? 'Not available'}</em></div>
+      {analysis.exchangeRate != null && analysis.exchangeRateDate && (
+        <small>
+          Exchange rate: 1 {analysis.exchangeRateBase} = {analysis.exchangeRate} {analysis.exchangeRateQuote}
+          · dated {analysis.exchangeRateDate}
+        </small>
+      )}
+    </div>
+  )
 }
 
 function ProductTile({ product, matched = false, matchPercent = '96%' }: { product: Product; matched?: boolean; matchPercent?: string }) {
@@ -629,7 +673,7 @@ export function CartPage() {
   const budgetCurrencyMatches = Boolean(intent && totals.currency === intent.currency)
   const overBudget = Boolean(budgetCurrencyMatches && intent && totals.total > intent.maximumBudget)
   const budgetUnavailable = Boolean(intent && totals.currency && !budgetCurrencyMatches)
-  const blocked = overBudget || budgetUnavailable || totals.hasMixedCurrencies
+  const blocked = overBudget || totals.hasMixedCurrencies
   const display = (amount: number) => formatMoney(amount, totals.currency ?? 'USD')
   const runCartUpdate = async (operation: () => Promise<void>, update: () => void) => {
     setMutationError('')
@@ -645,11 +689,11 @@ export function CartPage() {
       notify(message, 'error')
     }
   }
-  return <><PageTitle eyebrow="YOUR ORDER" title="Shopping cart" description="Your cart and product details are synchronized with the backend." action={<ButtonLink to="/products" variant="btn-outline" icon={<ShoppingBag size={16} />}>Continue shopping</ButtonLink>} />{cartError && <div className="form-error">{cartError}</div>}{cart.length === 0 ? <div className="panel empty-cart"><div className="empty-icon"><ShoppingCart size={27} /></div><h2>Your cart is waiting</h2><p>Add products from the supported catalogue to build and verify an order.</p><ButtonLink to="/products" icon={<ArrowRight size={16} />}>Explore products</ButtonLink></div> : <div className="cart-layout"><section className="panel cart-items"><div className="cart-items-heading"><div><h2>Items <span>({cart.reduce((sum, item) => sum + item.quantity, 0)})</span></h2><p>Current backend product prices (USD)</p></div><span className="status-chip status-warning"><i /> Seller not verified by catalogue</span></div>{cart.map(({ product, quantity }) => <div className="cart-item" key={product.id}><img src={product.image} alt={product.name} /><div className="cart-item-main"><Link to="/products">{product.name}</Link><span className="seller-line"><CircleAlert size={13} />Seller: Not provided by catalogue</span><div className="quantity-control"><button aria-label="Decrease quantity" onClick={() => void runCartUpdate(quantity === 1 ? () => removeCartProduct(product.id) : () => updateCartProduct(product.id, quantity - 1), () => quantity === 1 ? removeFromCart(product.id) : setQuantity(product.id, quantity - 1))}>−</button><span>{quantity}</span><button aria-label="Increase quantity" onClick={() => void runCartUpdate(() => updateCartProduct(product.id, quantity + 1), () => setQuantity(product.id, quantity + 1))}>+</button></div></div><div className="cart-item-price"><b>{formatMoney(product.price * quantity, product.currency)}</b><button className="remove-btn" onClick={() => void runCartUpdate(() => removeCartProduct(product.id), () => removeFromCart(product.id))} aria-label={`Remove ${product.name}`}><Trash2 size={15} /></button></div></div>)}<div className="cart-note"><ShieldCheck size={17} /><span>Any backend cart change invalidates previous verification and approval.</span></div></section><aside className="panel order-summary"><h2>Order summary</h2><p className="summary-muted">Shipping and tax are itemized demo estimates</p><div className="summary-row"><span>Subtotal</span><b>{display(totals.subtotal)}</b></div><div className="summary-row"><span>Estimated shipping</span><b>{display(totals.shipping)}</b></div><div className="summary-row"><span>Estimated tax (5%)</span><b>{display(totals.tax)}</b></div><div className="summary-row total-row"><b>Total ({totals.currency ?? 'mixed currencies'})</b><strong>{display(totals.total)}</strong></div>{intent && <div className={`budget-status ${blocked ? 'budget-over' : ''}`}><span>{budgetUnavailable ? <CircleAlert size={16} /> : overBudget ? <CircleAlert size={16} /> : <CheckCircle2 size={16} />}{budgetUnavailable ? 'Currency mismatch — comparison unavailable' : overBudget ? 'Over your stated budget' : 'Within your stated budget'}</span><b>{formatMoney(intent.maximumBudget, intent.currency)}</b></div>}{blocked && <div className="form-error">{budgetUnavailable ? `Catalogue prices are ${totals.currency}; your policy budget is ${intent?.currency}. No currency conversion is assumed.` : 'Resolve the mixed currency or budget issue before continuing.'}</div>}<Link aria-disabled={blocked} onClick={(event) => { if (blocked) event.preventDefault() }} to="/verification" className={`btn btn-primary btn-full ${blocked ? 'disabled-link' : ''}`}>Verify my order <ShieldCheck size={16} /></Link><p className="checkout-safe"><LockKeyhole size={13} /> Backend verification required before approval</p></aside></div>}</>
+  return <><PageTitle eyebrow="YOUR ORDER" title="Shopping cart" description="Your cart and product details are synchronized with the backend." action={<ButtonLink to="/products" variant="btn-outline" icon={<ShoppingBag size={16} />}>Continue shopping</ButtonLink>} />{cartError && <div className="form-error">{cartError}</div>}{cart.length === 0 ? <div className="panel empty-cart"><div className="empty-icon"><ShoppingCart size={27} /></div><h2>Your cart is waiting</h2><p>Add products from the supported catalogue to build and verify an order.</p><ButtonLink to="/products" icon={<ArrowRight size={16} />}>Explore products</ButtonLink></div> : <div className="cart-layout"><section className="panel cart-items"><div className="cart-items-heading"><div><h2>Items <span>({cart.reduce((sum, item) => sum + item.quantity, 0)})</span></h2><p>Current backend product prices (USD)</p></div><span className="status-chip status-warning"><i /> Seller not verified by catalogue</span></div>{cart.map(({ product, quantity }) => <div className="cart-item" key={product.id}><img src={product.image} alt={product.name} /><div className="cart-item-main"><Link to="/products">{product.name}</Link><span className="seller-line"><CircleAlert size={13} />Seller: Not provided by catalogue</span><div className="quantity-control"><button aria-label="Decrease quantity" onClick={() => void runCartUpdate(quantity === 1 ? () => removeCartProduct(product.id) : () => updateCartProduct(product.id, quantity - 1), () => quantity === 1 ? removeFromCart(product.id) : setQuantity(product.id, quantity - 1))}>−</button><span>{quantity}</span><button aria-label="Increase quantity" onClick={() => void runCartUpdate(() => updateCartProduct(product.id, quantity + 1), () => setQuantity(product.id, quantity + 1))}>+</button></div></div><div className="cart-item-price"><b>{formatMoney(product.price * quantity, product.currency)}</b><button className="remove-btn" onClick={() => void runCartUpdate(() => removeCartProduct(product.id), () => removeFromCart(product.id))} aria-label={`Remove ${product.name}`}><Trash2 size={15} /></button></div></div>)}<div className="cart-note"><ShieldCheck size={17} /><span>Any backend cart change invalidates previous verification and approval.</span></div></section><aside className="panel order-summary"><h2>Order summary</h2><p className="summary-muted">Shipping and tax are itemized demo estimates</p><div className="summary-row"><span>Subtotal</span><b>{display(totals.subtotal)}</b></div><div className="summary-row"><span>Estimated shipping</span><b>{display(totals.shipping)}</b></div><div className="summary-row"><span>Estimated tax (5%)</span><b>{display(totals.tax)}</b></div><div className="summary-row total-row"><b>Total ({totals.currency ?? 'mixed currencies'})</b><strong>{display(totals.total)}</strong></div>{intent && <div className={`budget-status ${blocked ? 'budget-over' : ''}`}><span>{budgetUnavailable ? <CircleAlert size={16} /> : overBudget ? <CircleAlert size={16} /> : <CheckCircle2 size={16} />}{budgetUnavailable ? 'Budget check pending server verification — comparison unavailable' : overBudget ? 'Over your stated budget' : 'Within your stated budget'}</span><b>{formatMoney(intent.maximumBudget, intent.currency)}</b></div>}{blocked && <div className="form-error">{budgetUnavailable ? `Catalogue prices are ${totals.currency}; your policy budget is ${intent?.currency}. No currency conversion is assumed.` : 'Resolve the mixed currency or budget issue before continuing.'}</div>}<Link aria-disabled={blocked} onClick={(event) => { if (blocked) event.preventDefault() }} to="/verification" className={`btn btn-primary btn-full ${blocked ? 'disabled-link' : ''}`}>Verify my order <ShieldCheck size={16} /></Link><p className="checkout-safe"><LockKeyhole size={13} /> Backend verification required before approval</p></aside></div>}</>
 }
 
 export function VerificationPage() {
-  const { cart, intent, backendOrder, backendVerification, setVerified, setBackendOrder, setBackendVerification, replaceCart, notify } = useApp()
+  const { cart, intent, backendOrder, backendVerification, verifiedFingerprint, setVerified, setBackendOrder, setBackendVerification, replaceCart, notify } = useApp()
   const navigate = useNavigate()
   const [working, setWorking] = useState(false)
   const [error, setError] = useState('')
@@ -664,6 +708,13 @@ export function VerificationPage() {
   const failed = checks.filter((check) => check.status === 'Failed').length
   const warnings = checks.filter((check) => check.status === 'Warning').length
   const passed = checks.filter((check) => check.status === 'Verified').length
+  const blockingChecks = backendVerification?.checks.filter((check) => check.critical && check.status === 'Failed') ?? []
+  const currentSnapshotVerified = Boolean(
+    cart.length
+    && backendOrder
+    && backendVerification?.status === 'Passed'
+    && verifiedFingerprint === getOrderFingerprint(cart, intent),
+  )
   const score = Math.max(0, Math.round((passed / checks.length) * 100 - warnings * 3 - failed * 20))
   const criticalFailures = backendVerification?.status !== 'Passed'
   const statusIcon = (status: string) => status === 'Verified' ? <CheckCircle2 size={19} /> : status === 'Warning' ? <CircleAlert size={19} /> : status === 'Pending' ? <Clock3 size={19} /> : <ShieldAlert size={19} />
@@ -672,15 +723,25 @@ export function VerificationPage() {
     setWorking(true)
     setError('')
     try {
-      const order = await createBackendOrder(intent)
-      replaceCart(order.items.map(({ product, quantity }) => ({
+      const currentFingerprint = getOrderFingerprint(cart, intent)
+      const existingOrderCart = backendOrder?.items.map(({ product, quantity }) => ({
         product: mapProduct(product),
         quantity,
-      })))
+      })) ?? []
+      const matchingOrder = backendOrder
+        && getOrderFingerprint(existingOrderCart, backendOrder.intent) === currentFingerprint
+        ? backendOrder
+        : null
+      const order = matchingOrder ?? await createBackendOrder(intent)
+      const verifiedCart = order.items.map(({ product, quantity }) => ({
+        product: mapProduct(product),
+        quantity,
+      }))
+      replaceCart(verifiedCart)
       setBackendOrder(order)
       const result = await verifyBackendOrder(order.id)
       setBackendVerification(result)
-      setVerified(result.status === 'Passed')
+      setVerified(result.status === 'Passed', verifiedCart)
       if (result.status === 'Passed') navigate('/approval')
       else notify('IntentLock found a critical issue. Review the failed checks before continuing.', 'error')
     } catch (cause) {
@@ -770,11 +831,92 @@ export function ApprovalPage() {
   return <><PageTitle eyebrow="EXPLICIT CUSTOMER AUTHORIZATION" title="Review and approve" description="Approval is recorded by the backend against the exact verified order version." />{(!verified || !backendOrder) && <div className="info-banner warning-banner"><CircleAlert size={18} /><span>The order has not passed backend verification or has changed. Re-run checks before approval.</span><Link to="/verification">Run verification</Link></div>}{approvalError && <div className="form-error">{approvalError}</div>}<div className="approval-security"><ShieldCheck size={19} /><div><b>{currentChecksPass ? 'Current order version verified' : 'Backend verification required'}</b><span>{backendOrder ? `Order version ${backendOrder.version}; changes require new verification and approval.` : 'No backend order snapshot exists.'}</span></div><Link to="/verification">Review checks</Link></div>{blocked ? <div className="panel empty-state"><ShieldAlert size={28} /><h3>Order cannot be approved yet</h3><p>Pass server-side verification before approving.</p><ButtonLink to={cart.length ? '/verification' : '/cart'}>{cart.length ? 'Verify this order' : 'Review cart'}</ButtonLink></div> : <div className="approval-layout"><section className="panel approval-order"><div className="panel-heading"><div><h2>Exact order details</h2><p>Backend order {backendOrder?.id}</p></div><span className="status-chip status-success"><i /> Version {backendOrder?.version} verified</span></div>{cart.map(({ product, quantity }) => <div className="approval-product" key={product.id}><img src={product.image} alt={product.name} /><div><b>{product.name}</b><span>{product.specifications.length ? product.specifications.join(' · ') : 'Specifications: Not available for verification'}</span><small>{quantity} × {formatMoney(product.price, product.currency)} · Seller: Not provided by catalogue</small></div><strong>{formatMoney(product.price * quantity, product.currency)}</strong></div>)}<div className="request-summary"><small>CUSTOMER PURCHASE POLICY</small><p>“{intent?.request ?? 'No purchase policy found.'}”</p></div><div className="summary-row"><span>Estimated shipping and tax</span><b>{display((backendVerification?.totals.shipping ?? totals.shipping) + (backendVerification?.totals.tax ?? totals.tax))}</b></div><div className="summary-row total-row"><b>Final amount</b><strong>{display(backendVerification?.totals.total ?? totals.total)}</strong></div>{intent && <div className="budget-status"><span><CheckCircle2 size={16} /> Customer budget ({intent.currency})</span><b>{formatMoney(intent.maximumBudget, intent.currency)}</b></div>}<div className="approval-check-results"><b>Backend verification results</b>{checks.map((check) => <span key={check.name}>{check.name}: <strong>{check.status}</strong></span>)}</div><label className="approve-checkbox"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>I explicitly approve this exact product, quantity, estimated fees, and total amount.</span></label><div className="approval-actions"><button className="btn btn-outline" onClick={() => { setApproved(false); navigate('/cart') }}>Reject order</button><button className="btn btn-primary" disabled={!confirmed || blocked || approving} onClick={() => void approve()}>{approving ? 'Recording approval…' : 'Approve exact order'} <ArrowRight size={16} /></button></div></section><aside className="approval-aside"><div className="aside-icon"><Fingerprint size={21} /></div><h3>Approval is order-specific</h3><p>The backend rejects payment if this order changes or the approval becomes stale.</p><div className="approval-includes"><b>You're approving</b><span><Check size={14} /> {cart.length} product{cart.length > 1 ? 's' : ''}</span><span><Check size={14} /> {cart.reduce((sum, item) => sum + item.quantity, 0)} unit{cart.reduce((sum, item) => sum + item.quantity, 0) > 1 ? 's' : ''}</span><span><Check size={14} /> {display(backendVerification?.totals.total ?? totals.total)} total</span></div></aside></div>}</>
 }
 
+function PaymentReceipt({ details }: { details: TransactionDetails }) {
+  const { transaction, order } = details
+  const productDetails = order.products.length
+    ? {
+      productNames: order.products.map(({ product }) => product.title || 'Not available').join(', '),
+      quantities: order.products.map(({ product, quantity }) =>
+        order.products.length === 1 ? String(quantity) : `${product.title || 'Product'}: ${quantity}`,
+      ).join('; '),
+      brands: order.products.map(({ product }) => product.brand || 'Not available').join(', '),
+      categories: order.products.map(({ product }) => product.category || 'Not available').join(', '),
+      marketplaces: order.products.map(({ marketplace }) => marketplace || 'Not available').join(', '),
+    }
+    : {
+      productNames: 'Not available',
+      quantities: 'Not available',
+      brands: 'Not available',
+      categories: 'Not available',
+      marketplaces: 'Not available',
+    }
+
+  return <div className="receipt-page">
+    <header className="receipt-confirmation panel">
+      <div className="result-icon success"><CheckCircle2 size={34} /></div>
+      <h1>Payment Successful</h1>
+      <p>PayPal Sandbox payment completed successfully.</p>
+      <div className="receipt-actions no-print">
+        <ButtonLink to="/transactions" variant="btn-outline">Transaction history</ButtonLink>
+      </div>
+    </header>
+    <section className="panel receipt-section receipt-summary-card">
+      <dl className="receipt-summary-list">
+        <div><dt>Product Name</dt><dd>{productDetails.productNames}</dd></div>
+        <div><dt>Quantity</dt><dd>{productDetails.quantities}</dd></div>
+        <div><dt>Brand</dt><dd>{productDetails.brands}</dd></div>
+        <div><dt>Category</dt><dd>{productDetails.categories}</dd></div>
+        <div className="receipt-marketplace"><dt>Marketplace</dt><dd>{productDetails.marketplaces}</dd></div>
+        <div className="receipt-total-paid"><dt>Total Amount Paid</dt><dd>{formatMoney(transaction.amount, transaction.currency)}</dd></div>
+      </dl>
+    </section>
+  </div>
+}
+
+export function TransactionReceiptPage() {
+  const { transactionId = '' } = useParams()
+  const [details, setDetails] = useState<TransactionDetails | null>(null)
+  const [loadedFor, setLoadedFor] = useState('')
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let active = true
+    getTransactionDetails(transactionId)
+      .then((result) => {
+        if (active) {
+          setDetails(result)
+          setError('')
+          setLoadedFor(transactionId)
+        }
+      })
+      .catch((cause: unknown) => {
+        if (active) {
+          setError(getBackendError(cause, 'Transaction receipt could not be loaded.'))
+          setLoadedFor(transactionId)
+        }
+      })
+    return () => { active = false }
+  }, [transactionId])
+
+  if (loadedFor !== transactionId) return <div className="panel api-state"><span className="spinner" /><p>Loading persisted transaction receipt…</p></div>
+  if (error || !details) return <div className="panel empty-state"><CircleAlert size={28} /><h2>Receipt unavailable</h2><p>{error || 'No completed transaction receipt is available.'}</p><ButtonLink to="/transactions">Back to transaction history</ButtonLink></div>
+  return <PaymentReceipt details={details} />
+}
+
 export function PaymentPage() {
   const { cart, intent, backendOrder, backendVerification, approved, verified, verifiedFingerprint, addTransaction, clearCart, notify } = useApp()
   const [searchParams] = useSearchParams()
-  const [processing, setProcessing] = useState(() => Boolean(searchParams.get('token')))
-  const [payment, setPayment] = useState<{ id: string; status: string } | null>(null)
+  const [processing, setProcessing] = useState(() => Boolean(
+    searchParams.get('token') || searchParams.get('cancelled') === '1',
+  ))
+  const [payment, setPayment] = useState<{
+    id: string | null
+    status: string
+    paypalOrderId: string | null
+  } | null>(null)
+  const [receiptDetails, setReceiptDetails] = useState<TransactionDetails | null>(null)
+  const [receiptLoading, setReceiptLoading] = useState(false)
+  const [receiptError, setReceiptError] = useState('')
   const [paymentError, setPaymentError] = useState('')
   const returnHandled = useRef(false)
   const totals = calculateCartTotals(cart)
@@ -786,17 +928,76 @@ export function PaymentPage() {
     && approved && verified && snapshotMatches,
   )
 
+  const handlePaymentResult = useCallback(async (
+    result: BackendPaymentResult,
+    paypalOrderId: string | null,
+  ) => {
+    setPayment({
+      id: result.paypal_reference ?? result.id,
+      status: result.status,
+      paypalOrderId,
+    })
+    if (result.status === 'COMPLETED') {
+      const transaction: Transaction = {
+        id: result.id ?? result.paypal_reference ?? result.order_id,
+        orderId: result.order_id,
+        product: result.product || cart.map((item) => item.product.name).join(', ') || 'TrustPay order',
+        amount: result.amount,
+        currency: result.currency,
+        date: result.date,
+        method: result.method,
+        status: 'Completed',
+        verification: 'Backend verified',
+      }
+      addTransaction(transaction)
+      setReceiptDetails(null)
+      setReceiptError('')
+      if (result.id) {
+        setReceiptLoading(true)
+        try {
+          setReceiptDetails(await getTransactionDetails(result.id))
+        } catch (cause) {
+          setReceiptError(getBackendError(cause, 'Payment was confirmed, but the persisted receipt could not be loaded.'))
+        } finally {
+          setReceiptLoading(false)
+        }
+      } else {
+        setReceiptError('Payment was confirmed, but the backend did not return a transaction reference for the receipt.')
+      }
+      if (result.cart_cleared) clearCart()
+      notify(
+        result.cart_cleared
+          ? 'Sandbox payment completed and transaction recorded.'
+          : 'Sandbox payment completed. Your current cart was preserved.',
+        result.cart_cleared ? 'success' : 'info',
+      )
+    } else if (result.status === 'CANCELLED') {
+      notify('PayPal Sandbox checkout was cancelled; no payment was captured.', 'info')
+    } else {
+      notify('PayPal has not confirmed completion. Check the payment status before retrying.', 'info')
+    }
+  }, [addTransaction, cart, clearCart, notify])
+  const paymentResultHandler = useRef(handlePaymentResult)
+  useEffect(() => {
+    paymentResultHandler.current = handlePaymentResult
+  }, [handlePaymentResult])
+
   useEffect(() => {
     if (returnHandled.current) return
     const paypalOrderId = searchParams.get('token')
-    if (searchParams.get('cancelled') === '1') {
-      returnHandled.current = true
-      return
-    }
-    if (!paypalOrderId) return
+    const cancelled = searchParams.get('cancelled') === '1'
+    const trustPayOrderId = searchParams.get('order_id')
+    if (!paypalOrderId && !cancelled) return
     returnHandled.current = true
     let active = true
-    capturePayPalOrder(paypalOrderId)
+    const request = cancelled
+      ? trustPayOrderId
+        ? cancelPayPalOrder(trustPayOrderId)
+        : Promise.reject(new Error('PayPal return is missing its TrustPay order reference.'))
+      : paypalOrderId
+        ? capturePayPalOrder(paypalOrderId)
+        : Promise.reject(new Error('PayPal return is missing its order reference.'))
+    request
       .then(async (result) => {
         if (!active) return
         let productNames = cart.map((item) => item.product.name).join(', ')
@@ -835,11 +1036,42 @@ export function PaymentPage() {
         }
       })
       .finally(() => { if (active) setProcessing(false) })
-    return () => { active = false }
-  }, [searchParams, addTransaction, cart, clearCart, notify])
-  const paymentResult = payment ?? (searchParams.get('cancelled') === '1'
-    ? { id: searchParams.get('order_id') ?? '', status: 'CANCELLED' }
-    : null)
+    return () => { active = false; returnHandled.current = false }
+  }, [searchParams, notify])
+
+  useEffect(() => {
+    if (!processing || payment || paymentError) return
+    const timer = setTimeout(() => {
+      setPaymentError('The backend did not respond in time. Click "Check payment status" to retry.')
+      setProcessing(false)
+    }, 120_000)
+    return () => clearTimeout(timer)
+  }, [processing, payment, paymentError])
+
+  const retryPaymentStatus = async () => {
+    if (processing) return
+    setProcessing(true)
+    setPaymentError('')
+    const paypalOrderId = payment?.paypalOrderId ?? searchParams.get('token')
+    const trustPayOrderId = searchParams.get('order_id')
+    try {
+      const result = searchParams.get('cancelled') === '1' && trustPayOrderId
+        ? await cancelPayPalOrder(trustPayOrderId)
+        : paypalOrderId
+          ? await capturePayPalOrder(paypalOrderId)
+          : null
+      if (!result) {
+        throw new Error('Payment return is missing its order reference.')
+      }
+      await paymentResultHandler.current(result, paypalOrderId)
+    } catch (cause) {
+      const message = getBackendError(cause, 'PayPal Sandbox could not confirm the payment result.')
+      setPaymentError(message)
+      notify(message, 'error')
+    } finally {
+      setProcessing(false)
+    }
+  }
 
   const pay = async () => {
     if (!paymentAllowed || processing || !backendOrder) return
@@ -864,11 +1096,53 @@ export function PaymentPage() {
       setProcessing(false)
     } finally { setProcessing(false) }
   }
-  if (processing && !paymentResult && !paymentError) return <div className="panel api-state"><span className="spinner" /><p>Waiting for PayPal Sandbox confirmation…</p></div>
-  if (paymentResult) {
-    const completed = paymentResult.status === 'COMPLETED'
-    const cancelled = paymentResult.status === 'CANCELLED'
-    return <div className="panel payment-result"><div className={`result-icon ${completed ? 'success' : 'failure'}`}>{completed ? <CheckCircle2 size={34} /> : <CircleAlert size={34} />}</div><span className="eyebrow">PAYPAL SANDBOX · LIVE PROVIDER RESPONSE</span><h1>{completed ? 'Sandbox payment completed' : cancelled ? 'Payment cancelled' : `Payment ${paymentResult.status.toLowerCase()}`}</h1><p>{completed ? 'PayPal confirmed the capture. The backend recorded the transaction.' : cancelled ? 'The PayPal checkout was cancelled; no payment was captured.' : 'PayPal did not confirm a completed capture. No successful payment is recorded.'}</p>{paymentResult.id && <div className="transaction-id"><small>PAYPAL REFERENCE</small><b>{paymentResult.id}</b></div>}<ButtonLink to="/transactions" icon={<ArrowRight size={16} />}>View transaction history</ButtonLink></div>
+  if (processing && !payment && !paymentError) return <div className="panel api-state"><span className="spinner" /><p>Checking PayPal Sandbox with the backend…</p></div>
+  if (payment?.status === 'COMPLETED') {
+    if (receiptDetails) return <PaymentReceipt details={receiptDetails} />
+    return <div className="panel payment-result">
+      <div className="result-icon success"><CheckCircle2 size={34} /></div>
+      <span className="eyebrow">PAYPAL SANDBOX · BACKEND CONFIRMED</span>
+      <h1>Sandbox payment completed</h1>
+      <p>PayPal confirmed the capture. IntentLock details are retrieved separately from the persisted order.</p>
+      {receiptLoading && <div className="receipt-loading"><span className="spinner" /> Loading persisted receipt…</div>}
+      {receiptError && <div className="form-error">{receiptError}</div>}
+      {payment.id && <button className="btn btn-primary" onClick={() => {
+        setReceiptLoading(true)
+        setReceiptError('')
+        void getTransactionDetails(payment.id)
+          .then(setReceiptDetails)
+          .catch((cause: unknown) => setReceiptError(getBackendError(cause, 'Transaction receipt could not be loaded.')))
+          .finally(() => setReceiptLoading(false))
+      }} disabled={receiptLoading}>{receiptLoading ? 'Loading receipt…' : 'Load transaction receipt'}</button>}
+      <ButtonLink to="/transactions" variant="btn-outline">View transaction history</ButtonLink>
+    </div>
+  }
+  if (payment) {
+    const completed = payment.status === 'COMPLETED'
+    const cancelled = payment.status === 'CANCELLED'
+    const pending = payment.status === 'PENDING'
+    const canRetry = pending || (Boolean(paymentError) && !completed && !cancelled)
+    return <div className="panel payment-result">
+      <div className={`result-icon ${completed ? 'success' : 'failure'}`}>{completed ? <CheckCircle2 size={34} /> : <CircleAlert size={34} />}</div>
+      <span className="eyebrow">PAYPAL SANDBOX · BACKEND VERIFIED STATUS</span>
+      <h1>{completed ? 'Sandbox payment completed' : cancelled ? 'Payment cancelled' : pending ? 'Payment pending confirmation' : `Payment ${payment.status.toLowerCase()}`}</h1>
+      <p>{completed ? 'PayPal confirmed the capture. The backend recorded the transaction.' : cancelled ? 'The PayPal checkout was cancelled; no payment was captured.' : 'PayPal has not confirmed completion. No successful payment is recorded yet.'}</p>
+      {paymentError && <div className="form-error">{paymentError}</div>}
+      {payment.id && <div className="transaction-id"><small>PAYPAL REFERENCE</small><b>{payment.id}</b></div>}
+      {canRetry && <button className="btn btn-primary" onClick={() => void retryPaymentStatus()} disabled={processing}>{processing ? 'Checking status…' : 'Check payment status'}</button>}
+      <ButtonLink to="/transactions" icon={<ArrowRight size={16} />}>View transaction history</ButtonLink>
+    </div>
+  }
+  if (paymentError && !payment && (searchParams.get('token') || searchParams.get('cancelled') === '1')) {
+    return <div className="panel payment-result">
+      <div className="result-icon failure"><CircleAlert size={34} /></div>
+      <span className="eyebrow">PAYPAL SANDBOX · STATUS NOT CONFIRMED</span>
+      <h1>Payment status needs checking</h1>
+      <p>{paymentError}</p>
+      <button className="btn btn-primary" onClick={() => void retryPaymentStatus()} disabled={processing}>
+        {processing ? 'Checking status…' : 'Check payment status'}
+      </button>
+    </div>
   }
   return <><PageTitle eyebrow="SECURE CHECKOUT" title="PayPal Sandbox Checkout" description="Checkout is created and captured by the backend using server-only sandbox credentials." />{paymentError && <div className="form-error">{paymentError}</div>}<div className="payment-layout"><section className="panel payment-main"><div className="paypal-brand"><span className="paypal-mark">P</span><b>PayPal</b><span className="sandbox-badge">SANDBOX TEST PAYMENT</span></div>{!paymentAllowed && <div className="info-banner warning-banner"><CircleAlert size={18} /><span>Payment is blocked until backend verification and explicit approval are current.</span><Link to={cart.length ? '/approval' : '/cart'}>{cart.length ? 'Review approval' : 'Build an order'}</Link></div>}<div className="payment-protection"><ShieldCheck size={19} /><div><b>Backend order state</b><small>Verification: {verified && snapshotMatches ? 'Current snapshot verified' : 'Not verified'} · Approval: {approved && snapshotMatches ? 'Approved' : 'Not approved'}</small></div>{paymentAllowed ? <CheckCircle2 size={18} /> : <CircleAlert size={18} />}</div><div className="payment-order-title"><h2>Verified order amount</h2><span>{cart.length} item{cart.length === 1 ? '' : 's'}</span></div>{cart.length ? cart.map(({ product, quantity }) => <div className="payment-item" key={product.id}><img src={product.image} alt={product.name} /><div><b>{product.name}</b><small>Qty {quantity} · Seller not verified by catalogue</small></div><strong>{formatMoney(product.price * quantity, product.currency)}</strong></div>) : <div className="empty-message">No order is ready for payment.</div>}<div className="summary-row total-row"><b>Total due</b><strong>{display(backendVerification?.totals.total ?? totals.total)}</strong></div><button className="paypal-button" onClick={() => void pay()} disabled={!paymentAllowed || processing}>{processing ? <><span className="spinner" /> Connecting to PayPal Sandbox…</> : <><span>Continue to</span> <b>PayPal</b> <ArrowRight size={16} /></>}</button><p className="sandbox-disclaimer">Sandbox only · Provider approval and capture are handled by the backend · No card data stored here</p></section><aside className="payment-aside"><div className="aside-icon"><LockKeyhole size={20} /></div><h3>Pre-payment recheck</h3><p>The backend rejects checkout if the approved order snapshot or cart has changed.</p><div className="payment-assurances"><span><CheckCircle2 size={15} /> Exact order approved: {approved && snapshotMatches ? 'Yes' : 'No'}</span><span><CheckCircle2 size={15} /> Server verification passed: {backendVerification?.status === 'Passed' ? 'Yes' : 'No'}</span><span><CheckCircle2 size={15} /> Sandbox transaction only</span></div></aside></div></>
 }
@@ -885,7 +1159,7 @@ export function TransactionsPage() {
   const filtered = transactions.filter((item) => (status === 'All statuses' || item.status === status) && (!cutoff || new Date(`${item.date}T00:00:00`) >= cutoff) && `${item.id} ${item.product} ${item.orderId}`.toLowerCase().includes(query.toLowerCase()))
   const pages = Math.max(1, Math.ceil(filtered.length / 5))
   const rows = filtered.slice((page - 1) * 5, page * 5)
-  return <><PageTitle eyebrow="PAYMENT ACTIVITY" title="Transaction history" description="A clear record of every order processed through TrustPay AI." action={<button className="btn btn-outline" onClick={() => window.print()}><Download size={15} /> Export history</button>} /><div className="panel transactions-panel"><div className="transaction-filters"><label className="search-field"><Search size={16} /><input placeholder="Search transactions..." value={query} onChange={(e) => { setQuery(e.target.value); setPage(1) }} /></label><select value={status} onChange={(e) => { setStatus(e.target.value); setPage(1) }}><option>All statuses</option><option>Completed</option><option>Failed</option></select><select className="select-button" aria-label="Date filter" value={dateRange} onChange={(e) => { const range = e.target.value; setDateRange(range); setDateCutoff(range === 'All time' ? null : Date.now() - (range === 'Last 30 days' ? 30 : 90) * 24 * 60 * 60 * 1000); setPage(1) }}><option>All time</option><option>Last 30 days</option><option>Last 90 days</option></select></div><div className="table-scroll"><table><thead><tr><th>TRANSACTION / ORDER</th><th>PRODUCT</th><th>DATE</th><th>METHOD</th><th>AMOUNT</th><th>STATUS</th><th></th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td><b>{row.id}</b><small>{row.orderId}</small></td><td>{row.product}</td><td>{new Date(`${row.date}T12:00:00`).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}</td><td>{row.method}</td><td><b>{formatMoney(row.amount, row.currency)}</b></td><td><span className={`status-chip ${row.status === 'Completed' ? 'status-success' : 'status-danger'}`}><i />{row.status}</span></td><td><button className="icon-btn" onClick={() => setSelected(selected === row.id ? null : row.id)} aria-label={`View ${row.id}`}><Eye size={16} /></button></td></tr>)}</tbody></table></div>{filtered.length === 0 && <div className="empty-message">No matching transactions.</div>}<div className="pagination"><span>Showing {filtered.length ? (page - 1) * 5 + 1 : 0}–{Math.min(page * 5, filtered.length)} of {filtered.length}</span><div><button className="btn btn-outline btn-sm" disabled={page === 1} onClick={() => setPage(page - 1)}>Previous</button><button className="btn btn-outline btn-sm" disabled={page >= pages} onClick={() => setPage(page + 1)}>Next</button></div></div></div>{selected && <div className="info-banner blue-banner"><FileCheck2 size={18} /><span>{selected}: status is {transactions.find((item) => item.id === selected)?.status}; IntentLock verification recorded.</span><button className="icon-btn" onClick={() => setSelected(null)} aria-label="Dismiss"><X size={16} /></button></div>}</>
+  return <><PageTitle eyebrow="PAYMENT ACTIVITY" title="Transaction history" description="A clear record of every order processed through TrustPay AI." action={<button className="btn btn-outline" onClick={() => window.print()}><Download size={15} /> Export history</button>} /><div className="panel transactions-panel"><div className="transaction-filters"><label className="search-field"><Search size={16} /><input placeholder="Search transactions..." value={query} onChange={(e) => { setQuery(e.target.value); setPage(1) }} /></label><select value={status} onChange={(e) => { setStatus(e.target.value); setPage(1) }}><option>All statuses</option><option>Completed</option><option>Failed</option></select><select className="select-button" aria-label="Date filter" value={dateRange} onChange={(e) => { const range = e.target.value; setDateRange(range); setDateCutoff(range === 'All time' ? null : Date.now() - (range === 'Last 30 days' ? 30 : 90) * 24 * 60 * 60 * 1000); setPage(1) }}><option>All time</option><option>Last 30 days</option><option>Last 90 days</option></select></div><div className="table-scroll"><table><thead><tr><th>TRANSACTION / ORDER</th><th>PRODUCT</th><th>DATE</th><th>METHOD</th><th>AMOUNT</th><th>STATUS</th><th></th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td><b>{row.id}</b><small>{row.orderId}</small></td><td>{row.product}</td><td>{new Date(`${row.date}T12:00:00`).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}</td><td>{row.method}</td><td><b>{formatMoney(row.amount, row.currency)}</b></td><td><span className={`status-chip ${row.status === 'Completed' ? 'status-success' : 'status-danger'}`}><i />{row.status}</span></td><td>{row.status === 'Completed' ? <Link className="icon-btn" to={`/transactions/${encodeURIComponent(row.id)}`} aria-label={`View receipt for ${row.id}`}><Eye size={16} /></Link> : <button className="icon-btn" onClick={() => setSelected(selected === row.id ? null : row.id)} aria-label={`View ${row.id}`}><Eye size={16} /></button>}</td></tr>)}</tbody></table></div>{filtered.length === 0 && <div className="empty-message">No matching transactions.</div>}<div className="pagination"><span>Showing {filtered.length ? (page - 1) * 5 + 1 : 0}–{Math.min(page * 5, filtered.length)} of {filtered.length}</span><div><button className="btn btn-outline btn-sm" disabled={page === 1} onClick={() => setPage(page - 1)}>Previous</button><button className="btn btn-outline btn-sm" disabled={page >= pages} onClick={() => setPage(page + 1)}>Next</button></div></div></div>{selected && <div className="info-banner blue-banner"><FileCheck2 size={18} /><span>{selected}: status is {transactions.find((item) => item.id === selected)?.status}; IntentLock verification recorded.</span><button className="icon-btn" onClick={() => setSelected(null)} aria-label="Dismiss"><X size={16} /></button></div>}</>
 }
 
 export function AuditLogPage() {

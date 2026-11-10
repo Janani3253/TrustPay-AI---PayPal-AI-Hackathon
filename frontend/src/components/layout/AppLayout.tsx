@@ -1,9 +1,9 @@
-import { useState } from 'react'
-import { NavLink, Outlet, useNavigate } from 'react-router-dom'
+import { useEffect, useRef, useState } from 'react'
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import {
   Activity, Bell, Boxes, ChevronLeft, ChevronRight, CircleAlert, ClipboardCheck,
   FileClock, LayoutDashboard, LogOut, Menu, Search, ShieldCheck, ShoppingBag,
-  ShoppingCart, X,
+  ShoppingCart, WalletCards, X,
 } from 'lucide-react'
 import { Brand } from '../common/Brand'
 import { useApp } from '../../context/AppContext'
@@ -17,6 +17,7 @@ const links = [
   { to: '/shopping-request', label: 'Shopping request', icon: Search },
   { to: '/product-results', label: 'Product results', icon: ShoppingBag },
   { to: '/cart', label: 'Shopping cart', icon: ShoppingCart },
+  { to: '/budget-planner', label: 'Budget Planner', icon: WalletCards },
   { to: '/verification', label: 'IntentLock', icon: ShieldCheck },
   { to: '/approval', label: 'Order approval', icon: ClipboardCheck },
   { to: '/transactions', label: 'Transactions', icon: Activity },
@@ -27,7 +28,9 @@ export function AppLayout() {
   const [collapsed, setCollapsed] = useState(false)
   const [mobileOpen, setMobileOpen] = useState(false)
   const [notificationsOpen, setNotificationsOpen] = useState(false)
+  const sideNavRef = useRef<HTMLElement>(null)
   const { user, setUser, cart, notify } = useApp()
+  const { pathname } = useLocation()
   const navigate = useNavigate()
   const initials = (user?.name ?? 'Alex Morgan').split(' ').map((part) => part[0]).slice(0, 2).join('').toUpperCase()
   const closeMenu = () => setMobileOpen(false)
@@ -49,7 +52,7 @@ export function AppLayout() {
       <aside className={`sidebar ${mobileOpen ? 'mobile-open' : ''}`}>
         <div className="sidebar-brand"><Brand /><button className="icon-btn mobile-close" onClick={closeMenu} aria-label="Close menu"><X size={19} /></button></div>
         <div className="workspace-label">WORKSPACE</div>
-        <nav className="side-nav">
+        <nav ref={sideNavRef} className="side-nav">
           {links.map(({ to, label, icon: Icon }) => (
             <NavLink key={to} to={to} onClick={closeMenu} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
               <Icon size={18} /><span>{label}</span>{to === '/cart' && cart.length > 0 && <b className="nav-count">{cart.length}</b>}

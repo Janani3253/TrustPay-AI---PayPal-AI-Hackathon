@@ -6,6 +6,7 @@ export interface ProductApiProduct {
   description: string
   category: string
   price: number
+  currency?: Currency
   rating: number
   brand?: string
   sku?: string
@@ -36,7 +37,7 @@ export interface Product {
   description: string
   category: string
   price: number
-  currency: 'USD'
+  currency: Currency
   seller: null
   sellerVerified: false
   rating: number
@@ -103,6 +104,7 @@ export interface ProductMatchAnalysis {
   normalized_score?: number
   match_tier?: 'FULL MATCH' | 'PARTIAL MATCH' | 'NOT VERIFIED' | 'EXCLUDED' | string
   categoryMatched: boolean
+  specificationsMatched?: boolean | null
   budgetMatched: boolean | null
   brandMatched?: boolean
   matches: RequirementMatch[]
@@ -149,6 +151,14 @@ export interface BackendVerification {
   status: 'Passed' | 'Failed'
   checks: BackendVerificationCheck[]
   totals: { subtotal: number; shipping: number; tax: number; total: number; currency: Currency }
+  budgetComparison?: {
+    amount: number | null
+    currency: Currency
+    exchangeRate: number | null
+    exchangeRateBase: Currency
+    exchangeRateQuote: Currency
+    exchangeRateDate: string | null
+  }
 }
 
 export interface Transaction {
@@ -161,6 +171,63 @@ export interface Transaction {
   method: string
   status: 'Completed' | 'Failed'
   verification: string
+}
+
+export interface TransactionDetails {
+  transaction: {
+    id: string
+    order_id: string
+    reference: string
+    provider: string
+    status: string
+    capture_status: string
+    paypal_capture_id: string | null
+    paypal_order_id: string | null
+    amount: number
+    currency: Currency
+    date: string
+    captured_at: string
+    payer: { name?: string; email?: string } | null
+  }
+  order: {
+    id: string
+    version: number
+    status: string
+    intent: Record<string, unknown>
+    products: Array<{
+      product: ProductApiProduct & { source?: string; provider?: string; url?: string }
+      quantity: number
+      unit_price: number
+      subtotal: number
+      provider: string
+      marketplace: string | null
+      product_url: string | null
+    }>
+    totals: { subtotal: number; shipping: number; tax: number; total: number; currency: Currency }
+    verification: {
+      status?: string
+      checks?: Array<{
+        name: string
+        status: string
+        reason: string
+        critical: boolean
+        expected?: unknown
+        actual?: unknown
+      }>
+      [key: string]: unknown
+    } | null
+    budget: {
+      maximum: number
+      currency: Currency
+      actual_total: number | null
+      remaining: number | null
+      status: string
+      exchange_rate: number | null
+      exchange_rate_base: Currency | null
+      exchange_rate_quote: Currency | null
+      exchange_rate_date: string | null
+    } | null
+  }
 }
 
 export interface AuditEvent {
