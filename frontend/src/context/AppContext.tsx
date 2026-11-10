@@ -1,8 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
-import { updateCart } from '../services/cartService'
+import { updateCart, type CartTotals } from '../services/cartService'
 import type { AuditRecord, BackendOrder, BackendVerification, CartItem, Product, PurchaseIntent, Transaction } from '../types'
 import { clearAuthToken, getCurrentUser, type DemoUser } from '../services/authService'
-import { getCart, getTransactions } from '../services/backendService'
+import { getBackendError, getCart, getTransactions } from '../services/backendService'
+import { DUMMYJSON_PLATFORM_ID } from '../services/productService'
 import { getOrderFingerprint } from '../utils/order'
 
 interface AppContextValue {
@@ -10,10 +11,13 @@ interface AppContextValue {
   authLoading: boolean
   selectedPlatformId: string | null
   cart: CartItem[]
+  cartTotals: CartTotals | null
+  cartSyncError: string | null
   intent: PurchaseIntent | null
   backendOrder: BackendOrder | null
   backendVerification: BackendVerification | null
   transactions: Transaction[]
+  transactionsSyncError: string | null
   approved: boolean
   verified: boolean
   verifiedFingerprint: string | null
@@ -21,7 +25,7 @@ interface AppContextValue {
   toasts: ToastNotice[]
   setUser: (user: DemoUser | null) => void
   setSelectedPlatformId: (platformId: string) => void
-  replaceCart: (cart: CartItem[]) => void
+  replaceCart: (cart: CartItem[], totals?: CartTotals | null) => void
   setBackendOrder: (order: BackendOrder | null) => void
   setBackendVerification: (verification: BackendVerification | null) => void
   addToCart: (product: Product) => void
@@ -58,58 +62,31 @@ function getStored<T>(key: string, fallback: T): T {
   }
 }
 
-function getSanitizedErrorMessage(error: unknown): string {
-  if (typeof error === 'object' && error !== null && 'response' in error) {
-    const response = error.response
-    if (typeof response === 'object' && response !== null && 'status' in response) {
-      const responseStatus = response.status
-      if (typeof responseStatus === 'number' && Number.isInteger(responseStatus)
-        && responseStatus >= 100 && responseStatus <= 599) {
-        return `Request failed with HTTP ${responseStatus}.`
-      }
-    }
-  }
-  return 'Request failed; details omitted.'
-}
-
-function getStoredCart(): CartItem[] {
-  const stored = getStored<unknown>('trustpay-cart', [])
-  if (!Array.isArray(stored)) {
-    console.warn('Saved cart data is not compatible with the Demo Product API and was cleared.')
-    return []
-  }
-  const valid = stored.every((item): item is CartItem => {
-    if (!item || typeof item !== 'object') return false
-    const cartItem = item as Partial<CartItem>
-    const product = cartItem.product
-    return Number.isInteger(cartItem.quantity) && (cartItem.quantity ?? 0) > 0
-      && !!product && product.source === 'DummyJSON'
-      && typeof product.id === 'string' && typeof product.name === 'string'
-      && typeof product.description === 'string' && typeof product.category === 'string'
-      && typeof product.price === 'number' && Number.isFinite(product.price)
-      && product.currency === 'USD' && product.seller === null
-      && product.sellerVerified === false && typeof product.rating === 'number'
-      && typeof product.image === 'string' && Array.isArray(product.specifications)
-  })
-  if (!valid) {
-    console.warn('Saved cart data is not compatible with the current API product format and was cleared.')
-    return []
-  }
-  return stored
+function getStoredIntent(userId: number): PurchaseIntent | null {
+  const stored = getStored<unknown>(`trustpay-intent-${userId}`, null)
+  if (!stored || typeof stored !== 'object') return null
+  const intent = stored as PurchaseIntent
+  if (intent.platformId && !['dummyjson', 'demo', 'dummy'].includes(intent.platformId)) return null
+  return { ...intent, platformId: DUMMYJSON_PLATFORM_ID }
 }
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<DemoUser | null>(null)
   const [authLoading, setAuthLoading] = useState(() => Boolean(localStorage.getItem('trustpay-access-token')))
-  const [selectedPlatformId, setSelectedPlatformId] = useState<string | null>(() => getStored('trustpay-platform-id', null))
-  const [cart, setCart] = useState<CartItem[]>(getStoredCart)
-  const [intent, setIntent] = useState<PurchaseIntent | null>(() => getStored('trustpay-intent', null))
+  const [selectedPlatformId, setSelectedPlatformId] = useState<string | null>(() => (
+    getStored('trustpay-platform-id', DUMMYJSON_PLATFORM_ID) || DUMMYJSON_PLATFORM_ID
+  ))
+  const [cart, setCart] = useState<CartItem[]>([])
+  const [cartTotals, setCartTotals] = useState<CartTotals | null>(null)
+  const [cartSyncError, setCartSyncError] = useState<string | null>(null)
+  const [intent, setIntent] = useState<PurchaseIntent | null>(null)
   const [backendOrder, setBackendOrder] = useState<BackendOrder | null>(null)
   const [backendVerification, setBackendVerification] = useState<BackendVerification | null>(null)
   const [transactions, setTransactions] = useState<Transaction[]>([])
+  const [transactionsSyncError, setTransactionsSyncError] = useState<string | null>(null)
   const [toasts, setToasts] = useState<ToastNotice[]>([])
-  const [verificationFingerprint, setVerificationFingerprint] = useState<string | null>(() => getStored('trustpay-verification-fingerprint', null))
-  const [approvalFingerprint, setApprovalFingerprint] = useState<string | null>(() => getStored('trustpay-approval-fingerprint', null))
+  const [verificationFingerprint, setVerificationFingerprint] = useState<string | null>(null)
+  const [approvalFingerprint, setApprovalFingerprint] = useState<string | null>(null)
   const [auditRecords, setAuditRecords] = useState<AuditRecord[]>(() => getStored('trustpay-audit-records', []))
   const fingerprint = getOrderFingerprint(cart, intent)
   const verified = cart.length > 0 && verificationFingerprint === fingerprint
@@ -130,46 +107,84 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [])
 
   useEffect(() => {
+    localStorage.removeItem('trustpay-cart')
+    localStorage.removeItem('trustpay-transactions')
+    localStorage.removeItem('trustpay-verification-fingerprint')
+    localStorage.removeItem('trustpay-approval-fingerprint')
+    localStorage.removeItem('trustpay-user')
+    localStorage.removeItem('trustpay-intent')
+  }, [])
+
+  useEffect(() => {
     let active = true
     const token = localStorage.getItem('trustpay-access-token')
     if (!token) return () => { active = false }
     getCurrentUser()
-      .then((currentUser) => { if (active) setUser(currentUser) })
+      .then((currentUser) => {
+        if (active) {
+          setUser(currentUser)
+          setIntent(getStoredIntent(currentUser.id))
+        }
+      })
       .catch((error: unknown) => {
         console.error('Could not restore the backend session.', getSanitizedErrorMessage(error))
         if (active) {
+          notify(getBackendError(error, 'Could not restore the backend session. Please sign in again.'), 'error')
           clearAuthToken()
           setUser(null)
+          setCart([])
+          setCartTotals(null)
+          setTransactions([])
+          setIntent(null)
+          setBackendOrder(null)
+          setBackendVerification(null)
+          setApprovalFingerprint(null)
+          setVerificationFingerprint(null)
+          setSelectedPlatformId(DUMMYJSON_PLATFORM_ID)
         }
       })
       .finally(() => { if (active) setAuthLoading(false) })
     return () => { active = false }
-  }, [])
+  }, [notify])
 
   useEffect(() => {
     if (!user) return
     let active = true
-    Promise.all([getCart(), getTransactions()])
-      .then(([remoteCart, remoteTransactions]) => {
+    getCart()
+      .then((remoteCart) => {
         if (active) {
-          setCart(remoteCart)
-          setTransactions(remoteTransactions)
+          setCart(remoteCart.items)
+          setCartTotals(remoteCart.totals)
+          setCartSyncError(null)
         }
       })
-      .catch((error: unknown) => console.error(
-        'Could not synchronize shopping data with the backend.',
-        getSanitizedErrorMessage(error),
-      ))
+      .catch((error: unknown) => {
+        console.error('Could not synchronize cart data with the backend.', error)
+        if (active) {
+          const message = getBackendError(error, 'The backend cart could not be loaded.')
+          setCartSyncError(message)
+          notify(message, 'error')
+        }
+      })
+    getTransactions()
+      .then((remoteTransactions) => {
+        if (active) {
+          setTransactions(remoteTransactions)
+          setTransactionsSyncError(null)
+        }
+      })
+      .catch((error: unknown) => {
+        console.error('Could not synchronize transactions with the backend.', error)
+        if (active) {
+          const message = getBackendError(error, 'Transactions could not be loaded from the backend.')
+          setTransactionsSyncError(message)
+          notify(message, 'error')
+        }
+      })
     return () => { active = false }
-  }, [user])
+  }, [user, notify])
 
-  useEffect(() => localStorage.setItem('trustpay-user', JSON.stringify(user)), [user])
   useEffect(() => localStorage.setItem('trustpay-platform-id', JSON.stringify(selectedPlatformId)), [selectedPlatformId])
-  useEffect(() => localStorage.setItem('trustpay-cart', JSON.stringify(cart)), [cart])
-  useEffect(() => localStorage.setItem('trustpay-intent', JSON.stringify(intent)), [intent])
-  useEffect(() => localStorage.setItem('trustpay-transactions', JSON.stringify(transactions)), [transactions])
-  useEffect(() => localStorage.setItem('trustpay-verification-fingerprint', JSON.stringify(verificationFingerprint)), [verificationFingerprint])
-  useEffect(() => localStorage.setItem('trustpay-approval-fingerprint', JSON.stringify(approvalFingerprint)), [approvalFingerprint])
   useEffect(() => localStorage.setItem('trustpay-audit-records', JSON.stringify(auditRecords)), [auditRecords])
 
   const value = useMemo<AppContextValue>(() => ({
@@ -177,27 +192,39 @@ export function AppProvider({ children }: { children: ReactNode }) {
     authLoading,
     selectedPlatformId,
     cart,
+    cartTotals,
+    cartSyncError,
     intent,
     backendOrder,
     backendVerification,
     transactions,
+    transactionsSyncError,
     approved,
     verified,
     verifiedFingerprint: verified ? fingerprint : null,
     auditRecords,
     toasts,
     setUser: (nextUser) => {
-      if (!nextUser) {
-        clearAuthToken()
+      if (!nextUser || (user && user.id !== nextUser.id)) {
+        if (!nextUser) clearAuthToken()
+        if (user) localStorage.removeItem(`trustpay-intent-${user.id}`)
         setCart([])
+        setCartTotals(null)
+        setCartSyncError(null)
         setTransactions([])
+        setTransactionsSyncError(null)
+        setIntent(null)
         setBackendOrder(null)
         setBackendVerification(null)
-        setSelectedPlatformId(null)
+        setApprovalFingerprint(null)
+        setVerificationFingerprint(null)
+        setSelectedPlatformId(DUMMYJSON_PLATFORM_ID)
       }
+      if (nextUser) setIntent(getStoredIntent(nextUser.id))
       setUser(nextUser)
     },
     setSelectedPlatformId: (platformId) => {
+      if (platformId !== DUMMYJSON_PLATFORM_ID) return
       if (selectedPlatformId === platformId) return
       setSelectedPlatformId(platformId)
       setIntent(null)
@@ -206,11 +233,30 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setApprovalFingerprint(null)
       setVerificationFingerprint(null)
       setCart([])
+      setCartTotals(null)
       notify('Shopping platform selected. Your previous order state was cleared.')
     },
-    replaceCart: (nextCart) => setCart(nextCart),
+    replaceCart: (nextCart, totals) => {
+      setCart(nextCart)
+      if (totals !== undefined) setCartTotals(totals)
+      setCartSyncError(null)
+    },
     addToCart: (product) => {
       setCart((current) => updateCart(current, product))
+      setCartTotals(null)
+      setCartSyncError(null)
+      getCart()
+        .then((remoteCart) => {
+          setCart(remoteCart.items)
+          setCartTotals(remoteCart.totals)
+          setCartSyncError(null)
+        })
+        .catch((error: unknown) => {
+          console.error('Could not refresh authoritative cart totals.', error)
+          const message = getBackendError(error, 'The backend cart could not be refreshed.')
+          setCartSyncError(message)
+          notify(message, 'error')
+        })
       setApprovalFingerprint(null)
       setVerificationFingerprint(null)
       setBackendOrder(null)
@@ -224,6 +270,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     },
     setQuantity: (productId, quantity) => {
       setCart((current) => current.map((item) => item.product.id === productId ? { ...item, quantity: Math.max(1, quantity) } : item))
+      setCartTotals(null)
       setApprovalFingerprint(null)
       setVerificationFingerprint(null)
       setBackendOrder(null)
@@ -232,6 +279,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     },
     removeFromCart: (productId) => {
       setCart((current) => current.filter((item) => item.product.id !== productId))
+      setCartTotals(null)
       setApprovalFingerprint(null)
       setVerificationFingerprint(null)
       setBackendOrder(null)
@@ -239,7 +287,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       notify('Product removed from cart. Verification and approval were cleared.', 'info')
     },
     setIntent: (nextIntent) => {
+      if (nextIntent.platformId !== DUMMYJSON_PLATFORM_ID) return
       setIntent(nextIntent)
+      if (user) localStorage.setItem(`trustpay-intent-${user.id}`, JSON.stringify(nextIntent))
       setApprovalFingerprint(null)
       setVerificationFingerprint(null)
       setBackendOrder(null)
@@ -290,6 +340,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     ]),
     clearCart: () => {
       setCart([])
+      setCartTotals(null)
       setApprovalFingerprint(null)
       setVerificationFingerprint(null)
       setBackendOrder(null)
@@ -302,7 +353,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setVerificationFingerprint(null)
     },
     setBackendVerification: (verification) => setBackendVerification(verification),
-  }), [user, authLoading, selectedPlatformId, cart, intent, backendOrder, backendVerification, transactions, approved, verified, fingerprint, auditRecords, toasts, recordAudit, notify, dismissToast])
+  }), [user, authLoading, selectedPlatformId, cart, cartTotals, cartSyncError, intent, backendOrder, backendVerification, transactions, transactionsSyncError, approved, verified, fingerprint, auditRecords, toasts, recordAudit, notify, dismissToast])
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>
 }

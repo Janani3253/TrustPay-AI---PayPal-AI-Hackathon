@@ -1,4 +1,7 @@
 import asyncio
+import sys
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import base64
 import hashlib
 import hmac
@@ -10,10 +13,12 @@ import secrets
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import logging
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
+
+logger = logging.getLogger("trustpay.app")
 
 import httpx
 from dotenv import load_dotenv
@@ -22,8 +27,30 @@ from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-logger = logging.getLogger(__name__)
-
+from app.core.config import settings
+from app.core.database import check_db_connectivity, close_db_engine
+from app.core.dependencies import get_current_user, get_optional_current_user
+from app.routers import (
+    auth_router,
+    users_router,
+    products_router,
+    platforms_router,
+    intent_router,
+    security_router,
+    cart_router,
+    verification_router,
+    orders_router,
+    approvals_router,
+    payments_router,
+    transactions_router,
+    dashboard_router,
+    audit_router,
+    ai_router,
+    intentlock_router,
+)
+from app.services.product_service import product_service
+from app.services.intent_service import intent_service
+from app.core.audit import add_audit
 from .database import connect, initialize_database
 from .gemini import interpret_product_request
 from .schemas import (
@@ -64,26 +91,61 @@ FEE_TAX_RATE = 0.05
 FX_API_BASE_URL = "https://api.frankfurter.dev/v2/rate"
 
 app = FastAPI(title="TrustPay AI IntentLock API", version="0.1.0")
-allowed_origins = [
-    origin.strip()
-    for origin in os.getenv(
-        "TRUSTPAY_CORS_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
-    ).split(",")
-    if origin.strip()
-]
+allowed_origins = settings.cors_origins
+is_wildcard = "*" in allowed_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
+    allow_origins=["*"] if is_wildcard else allowed_origins,
+    allow_credentials=not is_wildcard,
     allow_methods=["*"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["*"],
+    allow_origin_regex=r"https://.*\.onrender\.com" if not is_wildcard else None,
 )
+
+app.include_router(auth_router)
+app.include_router(users_router)
+app.include_router(products_router)
+app.include_router(platforms_router)
+app.include_router(intent_router)
+app.include_router(security_router)
+app.include_router(cart_router)
+app.include_router(verification_router)
+app.include_router(orders_router)
+app.include_router(approvals_router)
+app.include_router(payments_router)
+app.include_router(transactions_router)
+app.include_router(dashboard_router)
+app.include_router(audit_router)
+app.include_router(ai_router)
+app.include_router(intentlock_router)
 
 
 @app.on_event("startup")
-def startup() -> None:
+async def startup() -> None:
     initialize_database()
+    if settings.is_postgres_configured:
+        try:
+            import sqlalchemy as sa
+            from app.db.base import Base, SCHEMA_NAME
+            import app.models  # Register all models with Base.metadata
+            from app.core.database import get_async_engine
+            engine = get_async_engine()
+            if engine:
+                async with engine.begin() as conn:
+                    if SCHEMA_NAME:
+                        await conn.execute(sa.text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME}"))
+                    await conn.run_sync(Base.metadata.create_all)
+                logger.info("PostgreSQL database tables in schema '%s' verified and ready.", SCHEMA_NAME)
+        except Exception as exc:
+            logger.warning("PostgreSQL auto table creation on startup: %s", exc)
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await close_db_engine()
+    await product_service.close()
+    await intent_service.close()
 
 
 def utc_now() -> str:
@@ -170,52 +232,8 @@ def decode_token(token: str) -> int:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired access token.") from error
 
 
-def get_current_user(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bearer access token is required.")
-    user_id = decode_token(authorization.removeprefix("Bearer ").strip())
-    with connect() as connection:
-        user = connection.execute(
-            "SELECT id, name, email FROM users WHERE id = ?",
-            (user_id,),
-        ).fetchone()
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User account no longer exists.")
-    return dict(user)
-
-
-def add_audit(
-    user_id: int,
-    event_type: str,
-    description: str,
-    connection: sqlite3.Connection | None = None,
-) -> None:
-    event_id = str(uuid.uuid4())
-    timestamp = utc_now()
-
-    def insert_event(db: sqlite3.Connection) -> None:
-        previous = db.execute(
-            "SELECT hash FROM audit_events WHERE user_id = ? ORDER BY rowid DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        previous_hash = previous["hash"] if previous else "GENESIS"
-        payload = {"id": event_id, "type": event_type, "timestamp": timestamp, "description": description}
-        digest = hashlib.sha256(f"{previous_hash}:{json_dump(payload)}".encode()).hexdigest()
-        db.execute(
-            """INSERT INTO audit_events
-               (id, user_id, type, timestamp, description, previous_hash, hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (event_id, user_id, event_type, timestamp, description, previous_hash, digest),
-        )
-
-    if connection is not None:
-        insert_event(connection)
-        return
-    with connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        insert_event(db)
-
-
+# get_current_user provided by app.core.dependencies
+# add_audit is imported from app.core.audit
 async def dummyjson_get(path: str, params: dict[str, Any] | None = None) -> Any:
     try:
         async with httpx.AsyncClient(timeout=12) as client:
@@ -424,10 +442,14 @@ def convert_currency_amount(
 
 
 async def fetch_product(product_id: int) -> dict[str, Any]:
-    product = await dummyjson_get(f"/products/{product_id}")
-    if not isinstance(product, dict) or product.get("id") != product_id:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Product catalogue returned an invalid product.")
-    return product
+    try:
+        product = await product_service.get_product_details(product_id)
+        return product.model_dump(by_alias=True)
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Product catalogue returned an invalid product.",
+        ) from error
 
 
 async def current_cart(user_id: int) -> list[dict[str, Any]]:
@@ -963,8 +985,7 @@ def parse_intent(payload: IntentRequest) -> dict[str, Any]:
             break
 
     budget_match = re.search(
-        r"(?:under|below|less than|no more than|maximum|max|budget(?: of)?|up to)\s*"
-        r"(?:₹|rs\.?|inr|\$|usd)?\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?",
+        r"(?:under|below|less than|maximum|max|budget(?: of)?|up to)\s*(?:Γé╣|\$)?\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?",
         text,
         re.IGNORECASE,
     )
@@ -997,7 +1018,7 @@ def parse_intent(payload: IntentRequest) -> dict[str, Any]:
     currency = payload.currency
     if re.search(r"\$|usd|dollars?", text, re.IGNORECASE):
         currency = "USD"
-    elif re.search(r"₹|rs\.?|inr|rupees?", text, re.IGNORECASE):
+    elif re.search(r"Γé╣|inr|rupees?", text, re.IGNORECASE):
         currency = "INR"
 
     quantity_match = re.search(
@@ -1237,120 +1258,50 @@ async def paypal_access_token() -> str:
             detail="Could not connect to PayPal Sandbox authentication.",
         ) from error
 
-    if response.status_code == status.HTTP_401_UNAUTHORIZED:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="PayPal Sandbox rejected the backend credentials.",
-        )
-    if not response.is_success:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Could not authenticate with PayPal Sandbox.",
-        )
-    try:
-        token_response = response.json()
-    except ValueError as error:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="PayPal Sandbox returned an invalid authentication response.",
-        ) from error
-    access_token = token_response.get("access_token") if isinstance(token_response, dict) else None
-    if not isinstance(access_token, str) or not access_token:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="PayPal Sandbox returned an invalid authentication response.",
-        )
-    return access_token
-
-
-class PayPalTransportError(Exception):
-    pass
-
-
-async def paypal_api_request(
-    method: str,
-    path: str,
-    *,
-    payload: dict[str, Any] | None = None,
-    request_id: str | None = None,
-    access_token: str | None = None,
-) -> tuple[int, dict[str, Any]]:
-    token = access_token or await paypal_access_token()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {
+        "status": "ok",
+        "application": settings.APP_NAME,
+        "environment": settings.APP_ENV,
     }
-    if request_id:
-        headers["PayPal-Request-Id"] = request_id
-
-    for attempt in range(2):
-        try:
-            async with httpx.AsyncClient(timeout=25) as client:
-                response = await client.request(
-                    method,
-                    f"{PAYPAL_API_BASE_URL}{path}",
-                    headers=headers,
-                    json=payload,
-                )
-        except httpx.HTTPError as error:
-            raise PayPalTransportError from error
-
-        if response.status_code == status.HTTP_401_UNAUTHORIZED and attempt == 0:
-            token = await paypal_access_token()
-            headers["Authorization"] = f"Bearer {token}"
-            continue
-
-        try:
-            body = response.json()
-        except ValueError as error:
-            if response.is_success:
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail="PayPal Sandbox returned an invalid response.",
-                ) from error
-            body = {}
-        if not isinstance(body, dict):
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="PayPal Sandbox returned an invalid response.",
-            )
-        return response.status_code, body
-
-    raise PayPalTransportError("PayPal authentication could not be refreshed.")
 
 
-def payment_request_id(action: str, order_id: str) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"trustpay:{action}:{order_id}"))
-
-
-def validate_paypal_purchase_unit(
-    paypal_order: dict[str, Any],
-    order: Any,
-    paypal_order_id: str | None = None,
-) -> dict[str, Any]:
-    if paypal_order_id is not None and paypal_order.get("id") != paypal_order_id:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="PayPal returned a different order than the one approved.",
-        )
-    purchase_units = paypal_order.get("purchase_units")
-    if not isinstance(purchase_units, list) or len(purchase_units) != 1:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="PayPal returned an unexpected number of purchase units.",
-        )
-    purchase_unit = purchase_units[0]
-    if not isinstance(purchase_unit, dict):
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="PayPal returned an invalid purchase unit.",
-        )
-    if purchase_unit.get("reference_id") != order["id"]:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="PayPal purchase reference does not match the approved TrustPay order.",
-        )
+@app.get("/api/health")
+async def api_health() -> dict[str, Any]:
+    db_status = await check_db_connectivity()
+    if db_status.get("status") == "connected":
+        return {
+            "status": "ok",
+            "application": settings.APP_NAME,
+            "services": {
+                "postgresql": {
+                    "status": "connected",
+                    "engine": "PostgreSQL",
+                    "version": db_status.get("version", "16"),
+                }
+            },
+        }
+    elif db_status.get("status") == "not_configured":
+        return {
+            "status": "degraded",
+            "application": settings.APP_NAME,
+            "services": {
+                "postgresql": {
+                    "status": "not_configured",
+                }
+            },
+        }
+    else:
+        return {
+            "status": "degraded",
+            "application": settings.APP_NAME,
+            "services": {
+                "postgresql": {
+                    "status": "unavailable",
+                }
+            },
+        }
 
     amount = purchase_unit.get("amount")
     if not isinstance(amount, dict):
@@ -1378,6 +1329,7 @@ def validate_paypal_purchase_unit(
         )
     return purchase_unit
 
+# /api/intent/parse moved to app.routers.intent_router
 
 def paypal_create_response_needs_refresh(paypal_order: dict[str, Any]) -> bool:
     purchase_units = paypal_order.get("purchase_units")
@@ -1386,518 +1338,24 @@ def paypal_create_response_needs_refresh(paypal_order: dict[str, Any]) -> bool:
     if len(purchase_units) != 1 or not isinstance(purchase_units[0], dict):
         return False
 
-    purchase_unit = purchase_units[0]
-    amount = purchase_unit.get("amount")
-    if (
-        "reference_id" not in purchase_unit
-        or not isinstance(amount, dict)
-        or "value" not in amount
-        or "currency_code" not in amount
-    ):
-        return True
-
-    links = paypal_order.get("links")
-    has_approval_link = isinstance(links, list) and any(
-        isinstance(link, dict)
-        and link.get("rel") in {"approve", "payer-action"}
-        and isinstance(link.get("href"), str)
-        and link["href"]
-        for link in links
-    )
-    return paypal_order.get("status") is None or not has_approval_link
-
-
-def paypal_approval_url(paypal_order: dict[str, Any]) -> str:
-    links = paypal_order.get("links")
-    if not isinstance(links, list):
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="PayPal Sandbox did not return an approval URL.",
-        )
-    approval_url = next(
-        (
-            link.get("href")
-            for link in links
-            if isinstance(link, dict) and link.get("rel") in {"approve", "payer-action"}
-        ),
-        None,
-    )
-    try:
-        parsed_url = urlparse(approval_url) if isinstance(approval_url, str) else None
-        allowed_port = parsed_url is not None and parsed_url.port in (None, 443)
-    except ValueError:
-        parsed_url = None
-        allowed_port = False
-    if (
-        parsed_url is None
-        or parsed_url.scheme != "https"
-        or not allowed_port
-        or parsed_url.hostname is None
-        or not (
-            parsed_url.hostname == "sandbox.paypal.com"
-            or parsed_url.hostname.endswith(".sandbox.paypal.com")
-        )
-        or parsed_url.username is not None
-        or parsed_url.password is not None
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="PayPal Sandbox returned an invalid approval URL.",
-        )
-    return approval_url
-
-
-def validate_paypal_capture(
-    paypal_order: dict[str, Any],
-    order: Any,
-    paypal_order_id: str,
-) -> tuple[str, Decimal, str]:
-    if paypal_order.get("id") != paypal_order_id:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="PayPal returned a different order than the one approved.",
-        )
-    if paypal_order.get("status") != "COMPLETED":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="PayPal has not confirmed a completed payment.",
-        )
-    purchase_unit = validate_paypal_purchase_unit(paypal_order, order)
-    payments = purchase_unit.get("payments")
-    captures = payments.get("captures") if isinstance(payments, dict) else None
-    if not isinstance(captures, list) or len(captures) != 1 or not isinstance(captures[0], dict):
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="PayPal did not return exactly one payment capture.",
-        )
-
-    capture = captures[0]
-    capture_id = capture.get("id")
-    if capture.get("status") != "COMPLETED" or not isinstance(capture_id, str) or not capture_id:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="PayPal did not confirm a completed capture.",
-        )
-    if capture.get("final_capture") is False:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="PayPal returned a partial capture for the approved order.",
-        )
-    capture_amount = capture.get("amount")
-    if not isinstance(capture_amount, dict):
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="PayPal returned an invalid capture amount.",
-        )
-    try:
-        expected_amount = Decimal(str(order["total"])).quantize(Decimal("0.01"))
-        actual_amount = Decimal(str(capture_amount.get("value", "")))
-    except (InvalidOperation, ValueError):
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="PayPal returned an invalid capture amount.",
-        )
-    currency = capture_amount.get("currency_code")
-    if not actual_amount.is_finite() or actual_amount != expected_amount:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Captured amount does not match the customer-approved order amount.",
-        )
-    if currency != order["currency"]:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Captured currency does not match the customer-approved order currency.",
-        )
-    return capture_id, actual_amount, currency
-
-
-def payment_pending_response(order: Any) -> dict[str, Any]:
-    return {
-        "id": None,
-        "order_id": order["id"],
-        "paypal_reference": None,
-        "amount": order["total"],
-        "currency": order["currency"],
-        "date": datetime.now(timezone.utc).date().isoformat(),
-        "status": "PENDING",
-        "method": "PayPal Sandbox",
-    }
-
-
-def set_payment_status(order_id: str, user_id: int, next_status: str) -> None:
-    with connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        order = require_order(connection, order_id, user_id)
-        if order["status"] != "completed":
-            connection.execute(
-                "UPDATE orders SET status = ?, updated_at = ? WHERE id = ? AND user_id = ?",
-                (next_status, utc_now(), order_id, user_id),
-            )
-
-
-def audit_paypal_validation_error(user_id: int, order_id: str, error: HTTPException) -> None:
-    detail = error.detail.lower() if isinstance(error.detail, str) else ""
-    if "currency" in detail:
-        event_type = "Payment currency mismatch detected"
-    elif "amount" in detail:
-        event_type = "Payment amount mismatch detected"
-    else:
-        event_type = "Payment reconciliation required"
-    add_audit(
-        user_id,
-        event_type,
-        f"PayPal response validation failed for TrustPay order {order_id}.",
-    )
-
-
-def clear_cart_if_matches_order(connection: sqlite3.Connection, order: Any) -> bool:
-    stored_items = json_load(row_value(order, "cart_json", default=[]), default=[])
-    if not isinstance(stored_items, list):
-        return False
-    expected = sorted(
-        (int(item["product"]["id"]), int(item["quantity"]))
-        for item in stored_items
-    )
-    if not expected:
-        return False
-    current = sorted(
-        (int(row["product_id"]), int(row["quantity"]))
-        for row in connection.execute(
-            "SELECT product_id, quantity FROM cart_items WHERE user_id = ?",
-            (order["user_id"],),
-        )
-    )
-    if current != expected:
-        return False
-    connection.execute("DELETE FROM cart_items WHERE user_id = ?", (order["user_id"],))
-    return True
-
-
-def record_completed_payment(
-    order: Any,
-    user_id: int,
-    paypal_order_id: str,
-    capture_id: str,
-    amount: Decimal,
-    currency: str,
-) -> dict[str, Any]:
-    transaction_date = datetime.now(timezone.utc).date().isoformat()
-    transaction_id = f"TRX-{uuid.uuid4().hex[:12].upper()}"
-    with connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        latest_order = require_order(connection, order["id"], user_id)
-        if latest_order["paypal_order_id"] != paypal_order_id:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="PayPal order no longer matches the TrustPay order.",
-            )
-        existing = connection.execute(
-            "SELECT * FROM transactions WHERE order_id = ? AND user_id = ?",
-            (order["id"], user_id),
-        ).fetchone()
-        if existing:
-            if (
-                latest_order["status"] != "completed"
-                or existing["paypal_reference"] != capture_id
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="A different payment is already recorded for this TrustPay order.",
-                )
-            return {
-                "id": existing["id"],
-                "order_id": existing["order_id"],
-                "paypal_reference": existing["paypal_reference"],
-                "amount": existing["amount"],
-                "currency": existing["currency"],
-                "date": existing["date"],
-                "status": "COMPLETED",
-                "method": existing["method"],
-                "product": existing["product"],
-                "cart_cleared": False,
-            }
-        if latest_order["status"] not in {
-            "paypal_capturing",
-            "paypal_reconciling",
-            "reconciliation_required",
-            "paypal_pending",
-            "cancelled",
-        }:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="TrustPay order is not eligible for payment completion.",
-            )
-
-        stored_items = json_load(row_value(latest_order, "cart_json", default=[]), default=[])
-        product_names = ", ".join(
-            item["product"].get("title", "Product") for item in stored_items
-        )
-        connection.execute(
-            """
-            INSERT INTO transactions
-            (id, user_id, order_id, product, amount, currency, date, method, status, verification, paypal_reference)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                transaction_id,
-                user_id,
-                order["id"],
-                product_names,
-                float(amount),
-                currency,
-                transaction_date,
-                "PayPal Sandbox",
-                "Completed",
-                "Backend verified",
-                capture_id,
-            ),
-        )
-        connection.execute(
-            """
-            UPDATE orders
-            SET status = 'completed', paypal_capture_id = ?, updated_at = ?
-            WHERE id = ? AND user_id = ?
-            """,
-            (capture_id, utc_now(), order["id"], user_id),
-        )
-        cart_cleared = clear_cart_if_matches_order(connection, latest_order)
-
-    add_audit(
-        user_id,
-        "Sandbox payment completed",
-        f"PayPal Sandbox capture verified for order {order['id']}.",
-    )
-    return {
-        "id": transaction_id,
-        "order_id": order["id"],
-        "paypal_reference": capture_id,
-        "amount": float(amount),
-        "currency": currency,
-        "date": transaction_date,
-        "status": "COMPLETED",
-        "method": "PayPal Sandbox",
-        "product": product_names,
-        "cart_cleared": cart_cleared,
-    }
-
-
-async def reconcile_paypal_order(
-    order: Any,
-    user_id: int,
-    paypal_order_id: str,
-    access_token: str,
-    *,
-    cancel_if_unpaid: bool = False,
-) -> dict[str, Any]:
-    try:
-        response_status, paypal_order = await paypal_api_request(
-            "GET",
-            f"/v2/checkout/orders/{quote(paypal_order_id, safe='')}",
-            access_token=access_token,
-        )
-    except (PayPalTransportError, HTTPException) as error:
-        set_payment_status(order["id"], user_id, "reconciliation_required")
-        add_audit(
-            user_id,
-            "Payment reconciliation required",
-            f"PayPal status could not be confirmed for TrustPay order {order['id']}.",
-        )
-        return payment_pending_response(order)
-
-    if response_status != status.HTTP_200_OK:
-        set_payment_status(order["id"], user_id, "reconciliation_required")
-        add_audit(
-            user_id,
-            "Payment reconciliation required",
-            f"PayPal status could not be confirmed for TrustPay order {order['id']}.",
-        )
-        return payment_pending_response(order)
-
-    paypal_status = paypal_order.get("status")
-    if paypal_status == "COMPLETED":
-        try:
-            capture_id, amount, currency = validate_paypal_capture(
-                paypal_order,
-                order,
-                paypal_order_id,
-            )
-        except HTTPException as error:
-            set_payment_status(order["id"], user_id, "reconciliation_required")
-            audit_paypal_validation_error(user_id, order["id"], error)
-            raise
-        return record_completed_payment(
-            order,
-            user_id,
-            paypal_order_id,
-            capture_id,
-            amount,
-            currency,
-        )
-
-    if paypal_status in {"VOIDED", "CANCELLED"}:
-        set_payment_status(order["id"], user_id, "cancelled")
-        add_audit(
-            user_id,
-            "Sandbox payment cancelled",
-            f"PayPal reported a cancelled order for TrustPay order {order['id']}.",
-        )
-        response = payment_pending_response(order)
-        response["status"] = "CANCELLED"
-        return response
-
-    purchase_units = paypal_order.get("purchase_units")
-    if isinstance(purchase_units, list):
-        failed_capture = any(
-            capture.get("status") in {"DECLINED", "FAILED"}
-            for unit in purchase_units
-            if isinstance(unit, dict)
-            and isinstance(unit.get("payments"), dict)
-            and isinstance(unit["payments"].get("captures"), list)
-            for capture in unit["payments"]["captures"]
-            if isinstance(capture, dict)
-        )
-        if failed_capture or paypal_status == "DENIED":
-            set_payment_status(order["id"], user_id, "failed")
-            add_audit(
-                user_id,
-                "Sandbox payment failed",
-                f"PayPal reported a failed payment for TrustPay order {order['id']}.",
-            )
-            response = payment_pending_response(order)
-            response["status"] = "FAILED"
-            return response
-
-    if paypal_status in {"APPROVED", "CREATED"} and cancel_if_unpaid:
-        set_payment_status(order["id"], user_id, "cancelled")
-        add_audit(
-            user_id,
-            "Sandbox payment cancelled",
-            f"Customer cancelled TrustPay order {order['id']} before capture.",
-        )
-        response = payment_pending_response(order)
-        response["status"] = "CANCELLED"
-        return response
-
-    if paypal_status == "APPROVED":
-        set_payment_status(order["id"], user_id, "paypal_pending")
-    else:
-        set_payment_status(order["id"], user_id, "reconciliation_required")
-        add_audit(
-            user_id,
-            "Payment reconciliation required",
-            f"PayPal returned an unconfirmed status for TrustPay order {order['id']}.",
-        )
-    return payment_pending_response(order)
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
-
-
-@app.post("/api/auth/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterRequest) -> dict[str, Any]:
-    with connect() as connection:
-        try:
-            cursor = connection.execute(
-                "INSERT INTO users (name, email, password_hash, created_at) VALUES (?, ?, ?, ?)",
-                (payload.name.strip(), payload.email.lower(), make_password_hash(payload.password), utc_now()),
-            )
-        except sqlite3.IntegrityError as error:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An account with this email already exists.") from error
-        user = {"id": cursor.lastrowid, "name": payload.name.strip(), "email": payload.email.lower()}
-    add_audit(int(user["id"]), "Account registered", "Created a customer account.")
-    return {"access_token": create_token(int(user["id"])), "user": user}
-
-
-@app.post("/api/auth/login", response_model=AuthResponse)
-def login(payload: LoginRequest) -> dict[str, Any]:
-    with connect() as connection:
-        user = connection.execute(
-            "SELECT id, name, email, password_hash FROM users WHERE email = ?",
-            (payload.email.lower(),),
-        ).fetchone()
-    if user is None or not verify_password(payload.password, user["password_hash"]):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Email or password is incorrect.")
-    public_user = {"id": user["id"], "name": user["name"], "email": user["email"]}
-    add_audit(int(user["id"]), "User signed in", "Authenticated a customer session.")
-    return {"access_token": create_token(user["id"]), "user": public_user}
-
-
-@app.get("/api/auth/me", response_model=UserResponse)
-def get_me(user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
-    return user
-
-
-@app.get("/api/platforms")
-def platforms(user: dict[str, Any] = Depends(get_current_user)) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": "dummyjson",
-            "name": "DummyJSON Demo Store",
-            "supported": True,
-            "demo_only": True,
-            "description": "Catalogue browsing and product details are provided by DummyJSON.",
-        },
-        *[
-            {
-                "id": platform,
-                "name": platform,
-                "supported": False,
-                "demo_only": False,
-                "description": "Direct shopping integration is not configured for this platform.",
-            }
-            for platform in ("Amazon", "Flipkart", "Myntra")
-        ],
-    ]
-
-
-@app.post("/api/intent/parse")
-def intent_parse(payload: IntentRequest, user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
-    if payload.platformId != "dummyjson":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only the DummyJSON Demo Store is supported.")
-    intent = parse_intent(payload)
-    add_audit(user["id"], "Purchase policy created", "Created a purchase policy through the backend intent parser.")
-    return intent
-
-
-@app.get("/api/products")
-async def list_products(
-    q: str | None = None,
-    category: str | None = None,
-    limit: int = 200,
+@app.get("/api/recommendations/search")
+async def recommendations_get(
+    request: str = "",
+    category: str = "",
+    maximumBudget: float = 1000.0,
+    currency: str = "USD",
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
-    if not 1 <= limit <= 200:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="limit must be between 1 and 200.")
-    if q and q.strip():
-        return await dummyjson_get("/products/search", {"q": q.strip(), "limit": limit})
-    if category:
-        if not re.fullmatch(r"[a-z0-9-]{1,80}", category):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid product category.")
-        return await dummyjson_get(f"/products/category/{quote(category, safe='')}", {"limit": limit})
-    return await dummyjson_get("/products", {"limit": limit})
-
-
-@app.get("/api/products/categories")
-async def list_categories(user: dict[str, Any] = Depends(get_current_user)) -> list[dict[str, Any]]:
-    result = await dummyjson_get("/products/categories")
-    if not isinstance(result, list):
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="The product catalogue returned an invalid category list.",
-        )
-    return [
-        {"slug": item, "name": item.replace("-", " ").title(), "url": ""}
-        if isinstance(item, str)
-        else item
-        for item in result
-    ]
-
-
-@app.get("/api/products/{product_id}")
-async def product_details(product_id: int, user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
-    return await fetch_product(product_id)
+    payload = {
+        "intent": {
+            "request": request,
+            "category": category,
+            "maximumBudget": maximumBudget,
+            "currency": currency,
+            "requirements": [],
+        }
+    }
+    return await recommendations(payload=payload, user=user)
 
 
 @app.post("/api/recommendations/search")
@@ -1908,633 +1366,34 @@ async def recommendations(
     intent = payload.get("intent")
 
     if not isinstance(intent, dict):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="An intent object is required.",
-        )
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="An intent object is required.")
 
-    query = intent.get("request", "")
-    if not isinstance(query, str) or not query.strip():
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="A valid shopping request is required.",
-        )
-    if intent.get("platformId", "dummyjson") != "dummyjson":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only the DummyJSON Demo Store is supported for product recommendations.",
-        )
-
-    raw_category = intent.get("category") or ""
-    category_explicit_value = intent.get("categoryIsExplicit")
-    category_is_explicit = (
-        category_explicit_value
-        if isinstance(category_explicit_value, bool)
-        else bool(raw_category)
-    )
-    if raw_category and (
-        not isinstance(raw_category, str)
-        or not re.fullmatch(r"[a-z0-9-]{1,80}", raw_category)
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Invalid product category.",
-        )
-
-    raw_currency = str(intent.get("currency", "USD")).upper()
-    parser_currency = raw_currency if raw_currency in {"USD", "INR"} else "USD"
-    try:
-        parser_budget = Decimal(str(intent.get("maximumBudget", 1) or 1))
-        if not parser_budget.is_finite() or parser_budget <= 0:
-            parser_budget = Decimal("1")
-    except (InvalidOperation, TypeError, ValueError):
-        parser_budget = Decimal("1")
-    parsed_request = parse_intent(IntentRequest(
-        request=query,
-        maximumBudget=float(parser_budget),
-        currency=parser_currency,
-        trustedSellersOnly=bool(intent.get("trustedSellersOnly", False)),
-    ))
-    parsed_price_range = bool(re.search(
-        r"\b(?:under|below|less than|no more than|maximum|max|budget(?: of)?|"
-        r"up to|between|from)\b\s*(?:[^\w\s]\s*|rs\.?\s*|inr\s*|usd\s*)?\d",
-        query,
-        re.IGNORECASE,
-    ))
-    interpretation = await interpret_product_request(query)
-
-    if category_is_explicit and raw_category:
-        category = raw_category
-        normalized_raw_category = raw_category.casefold()
-        parsed_category_families = _category_families(parsed_request["category"])
-        raw_category_families = _category_families(raw_category)
-        if (
-            parsed_category_families.intersection(raw_category_families)
-            and normalized_raw_category not in {
-                "mens-watches", "womens-watches", "mens-shoes",
-                "womens-shoes", "mens-shirts", "womens-dresses",
-            }
-        ):
-            category_terms = parsed_request["categoryTerms"]
-        else:
-            category_terms = []
-        if interpretation:
-            interpretation_families = _category_families(
-                " ".join((interpretation.category, *interpretation.category_terms))
-            )
-            if not raw_category_families or raw_category_families.intersection(interpretation_families):
-                category_terms.extend(interpretation.category_terms)
-    else:
-        category = (
-            interpretation.category
-            if interpretation and interpretation.category
-            else parsed_request["category"] or raw_category
-        )
-        category_terms = [
-            *parsed_request["categoryTerms"],
-            *(interpretation.category_terms if interpretation else []),
-        ] or intent.get("categoryTerms", [])
-    if not isinstance(category_terms, list):
-        category_terms = []
-    category_terms = list(dict.fromkeys(
-        str(term).strip()
-        for term in category_terms
-        if str(term).strip()
-    ))
-
-    client_requirements = intent.get("requirements", [])
-    if not isinstance(client_requirements, list):
-        client_requirements = []
-    requirements = [
-        requirement for requirement in client_requirements
-        if isinstance(requirement, dict)
-    ]
-    requirements.extend(parsed_request["requirements"])
-    unique_requirements: dict[tuple[str, str], dict[str, Any]] = {}
-    for requirement in requirements:
-        key = (
-            str(requirement.get("name", "Specification")).casefold(),
-            re.sub(r"[^a-z0-9]", "", str(requirement.get("value", "")).casefold()),
-        )
-        unique_requirements.setdefault(key, requirement)
-    requirements = list(unique_requirements.values())
-
-    client_exclusions = intent.get("exclusions", [])
-    if not isinstance(client_exclusions, list):
-        client_exclusions = []
-    exclusions = [
-        exclusion for exclusion in client_exclusions
-        if isinstance(exclusion, dict)
-    ] + parsed_request["exclusions"]
-    exclusions = list({
-        (
-            str(exclusion.get("name", "Feature")).casefold(),
-            str(exclusion.get("value", "")).casefold(),
-        ): exclusion
-        for exclusion in exclusions
-    }.values())
-    excluded_values = {
-        str(exclusion.get("value", "")).casefold()
-        for exclusion in exclusions
-    }
-    requirements = [
-        requirement for requirement in requirements
-        if str(requirement.get("value", "")).casefold() not in excluded_values
-    ]
-    intent = dict(intent)
-    intent["category"] = category
-    intent["categoryTerms"] = category_terms
-    intent["categoryIsExplicit"] = bool(category_is_explicit and raw_category)
-    intent["requirements"] = requirements
-    intent["exclusions"] = exclusions
-    if parsed_price_range:
-        intent["maximumBudget"] = parsed_request["maximumBudget"]
-    elif (
-        interpretation
-        and interpretation.maximum_budget is not None
-        and re.search(r"\b(?:budget|spend|afford|pay)\b", query, re.IGNORECASE)
-    ):
-        interpreted_budget = Decimal(str(interpretation.maximum_budget))
-        if interpreted_budget.is_finite() and interpreted_budget > 0:
-            intent["maximumBudget"] = float(interpreted_budget)
-    if parsed_request["minimumBudget"] is not None:
-        intent["minimumBudget"] = parsed_request["minimumBudget"]
-    elif "minimumBudget" not in intent:
-        intent["minimumBudget"] = None
-    if re.search(r"\$|usd|dollars?", query, re.IGNORECASE):
-        intent["currency"] = "USD"
-    elif re.search(r"₹|rs\.?|inr|rupees?", query, re.IGNORECASE):
-        intent["currency"] = "INR"
-    elif raw_currency:
-        intent["currency"] = raw_currency
-    if parsed_request["quantity"] != 1:
-        intent["quantity"] = parsed_request["quantity"]
-    intent["excludeAccessories"] = bool(
-        intent.get("excludeAccessories") or parsed_request["excludeAccessories"]
-    )
-
-    interpreted_search_terms = (
-        [
-            interpretation.product_type,
-            *interpretation.search_terms,
-            *(
-                f"{attribute.value} {attribute.name}"
-                for attribute in interpretation.attributes
-            ),
-        ]
-        if interpretation
-        else []
-    )
-    provider_search_terms = interpreted_search_terms or [
-        *category_terms,
-        query,
-    ]
-    products = await _fetch_catalogue_products(provider_search_terms)
-    catalogue_brands = {
-        str(product.get("brand", "")).strip()
-        for product in products
-        if isinstance(product, dict) and str(product.get("brand", "")).strip()
-    }
-    requested_brands = _extract_brands(_mandatory_query_text(query), catalogue_brands)
-    preferred_brands = (
-        interpretation.brand_preferences
-        if interpretation
-        else []
-    )
-    mandatory_terms = _mandatory_request_terms(
-        query, requirements, category, category_terms
-    )
-
-    keywords = {
-        token for token in _normalized_tokens(query) - _REQUEST_STOP_WORDS
-        if not token.isdigit()
-    }
-    for requirement in requirements:
-        keywords.difference_update(_normalized_tokens(requirement.get("value", "")))
-        keywords.difference_update(_normalized_tokens(requirement.get("name", "")))
-    keywords.difference_update(_normalized_tokens(str(intent.get("maximumBudget", ""))))
-    keywords.difference_update(_normalized_tokens(str(intent.get("minimumBudget", ""))))
-    keywords.difference_update(_normalized_tokens(" ".join(requested_brands)))
-    keywords.difference_update(_normalized_tokens(category))
-    for term in category_terms:
-        keywords.difference_update(_normalized_tokens(term))
-
-    currency = str(intent.get("currency", "USD")).upper()
-
-    try:
-        budget_decimal = Decimal(str(intent.get("maximumBudget", 0) or 0))
-        has_budget = budget_decimal.is_finite() and budget_decimal > 0
-    except (InvalidOperation, TypeError, ValueError):
-        budget_decimal = Decimal("0")
-        has_budget = False
-    invalid_maximum_budget = (
-        intent.get("maximumBudget") is not None
-        and not has_budget
-    )
-
-    try:
-        minimum_budget = Decimal(str(intent.get("minimumBudget")))
-        has_minimum_budget = minimum_budget.is_finite() and minimum_budget > 0
-    except (InvalidOperation, TypeError, ValueError):
-        minimum_budget = Decimal("0")
-        has_minimum_budget = False
-    invalid_minimum_budget = (
-        intent.get("minimumBudget") is not None
-        and not has_minimum_budget
-    )
-
-    try:
-        quantity = int(intent.get("quantity", 1))
-        quantity_is_valid = 1 <= quantity <= 99
-        if not quantity_is_valid:
-            quantity = 1
-    except (TypeError, ValueError):
-        quantity_is_valid = False
-        quantity = 1
-
-    product_currencies = {
-        str(product.get("currency") or "USD").upper()
-        for product in products
-        if isinstance(product, dict)
-    }
-    exchange_rates: dict[str, dict[str, Any] | None] = {}
-    for product_currency in product_currencies:
-        exchange_rates[product_currency] = await get_exchange_rate(product_currency, currency)
-
-    enriched = []
-    rejection_reasons: set[str] = set()
-
-    for product in products:
-        if not isinstance(product, dict):
-            continue
-
-        product_category = str(product.get("category", ""))
-        title = str(product.get("title", ""))
-        brand = str(product.get("brand", ""))
-        tags = product.get("tags", [])
-        if not isinstance(tags, list):
-            tags = []
-        specifications_text = _structured_product_text(product)
-        product_text = " ".join(
-            [title, brand, product_category, specifications_text]
-            + [str(tag) for tag in tags]
-        )
-        product_tokens = _normalized_tokens(product_text)
-        interpreted_relevance = 0.0
-        if interpretation:
-            for phrase in (
-                interpretation.product_type,
-                *interpretation.search_terms,
-                *(
-                    f"{attribute.value} {attribute.name}"
-                    for attribute in interpretation.attributes
-                ),
-            ):
-                phrase_tokens = _normalized_tokens(phrase) - _REQUEST_STOP_WORDS
-                if phrase_tokens:
-                    interpreted_relevance = max(
-                        interpreted_relevance,
-                        len(phrase_tokens.intersection(product_tokens)) / len(phrase_tokens),
-                    )
-
-        matched_category = _category_matches_product(
-            product_category,
-            category,
-            category_terms,
-            bool(category_is_explicit),
-            _product_category_evidence(product),
-        )
-        if not matched_category:
-            rejection_reasons.add(f"category {category or ' '.join(category_terms)}")
-            continue
-
-        if intent.get("excludeAccessories") and re.search(
-            r"\b(accessory|accessories|case|charger|cable|adapter)\b",
-            title,
-            re.IGNORECASE,
-        ):
-            rejection_reasons.add("accessory exclusion")
-            continue
-
-        brand_matched = _product_brand_matches(requested_brands, product)
-        keyword_hits = len(keywords.intersection(product_tokens))
-        name_relevance = max(
-            keyword_hits / len(keywords) if keywords else 0.0,
-            interpreted_relevance,
-        )
-        preferred_brand_matched = any(
-            _product_brand_matches([brand], product) is True
-            for brand in preferred_brands
-        )
-
-        try:
-            price_decimal = Decimal(str(product["price"]))
-            price_is_valid = price_decimal.is_finite() and price_decimal >= 0
-        except (KeyError, InvalidOperation, TypeError, ValueError):
-            price_decimal = Decimal("0")
-            price_is_valid = False
-
-        product_currency = str(product.get("currency") or "USD").upper()
-        rate_info = exchange_rates.get(product_currency)
-        estimated_totals = (
-            cart_price([{"product": {"price": float(price_decimal)}, "quantity": quantity}])
-            if price_is_valid
-            else None
-        )
-        converted_price = (
-            convert_currency_amount(price_decimal, product_currency, currency, rate_info)
-            if price_is_valid
-            else None
-        )
-        converted_shipping = (
-            convert_currency_amount(estimated_totals["shipping"], product_currency, currency, rate_info)
-            if estimated_totals
-            else None
-        )
-        converted_tax = (
-            convert_currency_amount(estimated_totals["tax"], product_currency, currency, rate_info)
-            if estimated_totals
-            else None
-        )
-        converted_total = (
-            convert_currency_amount(estimated_totals["total"], product_currency, currency, rate_info)
-            if estimated_totals
-            else None
-        )
-        comparison_amount = converted_total["amount"] if converted_total else None
-        budget_matches = (
-            comparison_amount is not None
-            and Decimal(str(comparison_amount)) <= budget_decimal
-        ) if has_budget and comparison_amount is not None else None
-        minimum_budget_matches = (
-            converted_price is not None
-            and Decimal(str(converted_price["amount"])) >= minimum_budget
-        ) if has_minimum_budget else True
-
-        matches = []
-        for requirement in requirements:
-            name = str(requirement.get("name", "Specification"))
-            requested = str(requirement.get("value", ""))
-            verified = _requirement_is_verified(requirement, product)
-            if verified:
-                match_status = "Matched"
-                explanation = (
-                    "The requested value is present in structured product catalogue data."
-                )
-            else:
-                match_status = "Not available for verification"
-                explanation = (
-                    "The public catalogue does not provide structured technical "
-                    "information to verify this specification."
-                )
-
-            matches.append({
-                "name": name,
-                "requested": requested,
-                "status": match_status,
-                "explanation": explanation,
-            })
-
-        all_specs_mentioned = bool(matches) and all(
-            match["status"] == "Matched" for match in matches
-        )
-        exclusion_checks = [
-            _exclusion_is_verified(exclusion, product)
-            for exclusion in exclusions
-            if isinstance(exclusion.get("name"), str)
-            and isinstance(exclusion.get("value"), str)
-        ]
-        constraints = []
-        if intent.get("excludeAccessories"):
-            constraints.append({
-                "name": "No accessories",
-                "status": "Matched",
-                "explanation": "No excluded accessory was found in the product title.",
-            })
-        if intent.get("trustedSellersOnly"):
-            constraints.append({
-                "name": "Trusted seller",
-                "status": "Not available for verification",
-                "explanation": "Seller identity and trust status are not supplied by the catalogue.",
-            })
-
-        exclusions_satisfied = (
-            len(exclusion_checks) == len(exclusions)
-            and all(attribute_present and not excluded_value_present
-                    for attribute_present, excluded_value_present in exclusion_checks)
-        )
-        failed_requirements = []
-        if requested_brands and brand_matched is not True:
-            failed_requirements.extend(f"brand {brand}" for brand in requested_brands)
-        failed_requirements.extend(
-            f"{match['name']} {match['requested']}"
-            for match in matches
-            if match["status"] != "Matched"
-        )
-        if not exclusions_satisfied:
-            failed_requirements.extend(
-                f"excluded characteristic {exclusion.get('value', '')}"
-                for exclusion in exclusions
-            )
-        if has_budget and budget_matches is not True:
-            failed_requirements.append(
-                f"maximum budget in {currency}"
-                if comparison_amount is not None
-                else f"currency conversion to {currency}"
-            )
-        if has_minimum_budget and not minimum_budget_matches:
-            failed_requirements.append(f"minimum budget in {currency}")
-        if invalid_maximum_budget:
-            failed_requirements.append("valid maximum budget")
-        if invalid_minimum_budget:
-            failed_requirements.append("valid minimum budget")
-        if not quantity_is_valid:
-            failed_requirements.append("valid requested quantity")
-        if not price_is_valid:
-            failed_requirements.append("valid catalogue price")
-        if failed_requirements:
-            rejection_reasons.update(failed_requirements)
-            continue
-
-        score_numerator = 35 * name_relevance
-        score_denominator = 35
-        if requested_brands:
-            score_denominator += 25
-            score_numerator += 25 if brand_matched else 0
-        if category:
-            score_denominator += 15
-            score_numerator += 15 if matched_category else 0
-        if requirements:
-            spec_evidence = sum(
-                0.5 if match["status"] == "Mentioned in catalogue (unverified)" else 0
-                for match in matches
-            ) / len(requirements)
-            score_denominator += 20
-            score_numerator += 20 * spec_evidence
-        if has_budget:
-            score_denominator += 15
-            score_numerator += 15 if budget_matches is True else 0
-        if constraints:
-            constraint_evidence = sum(
-                constraint["status"] == "Matched" for constraint in constraints
-            ) / len(constraints)
-            score_denominator += 10
-            score_numerator += 10 * constraint_evidence
-        if preferred_brands:
-            score_denominator += 10
-            score_numerator += 10 if preferred_brand_matched else 0
-        percentage = round(score_numerator / score_denominator * 100)
-
-        requested_name_matched = bool(mandatory_terms) and mandatory_terms.issubset(product_tokens)
-        requested_brand_matched = not requested_brands or brand_matched is True
-        requested_specs_satisfied = not requirements or all_specs_mentioned
-        requested_constraints_satisfied = all(
-            constraint["status"] == "Matched" for constraint in constraints
-        )
-        budget_eligible = not has_budget or budget_matches is True
-        currency_verified = not has_budget or comparison_amount is not None
-        category_eligible = not category or matched_category
-        exact_match = (
-            requested_name_matched
-            and requested_brand_matched
-            and category_eligible
-            and requested_specs_satisfied
-            and requested_constraints_satisfied
-            and budget_eligible
-            and currency_verified
-        )
-        relevant = (
-            name_relevance > 0
-            or brand_matched is True
-            or preferred_brand_matched
-        )
-        match_type = (
-            "Exact Match" if exact_match
-            else "Partial Match" if relevant or matched_category
-            else "No Match"
-        )
-
-        if has_budget and (converted_total is None or not price_is_valid):
-            recommendation_status = "Exchange Rate Unavailable"
-        elif has_budget and budget_matches is False:
-            recommendation_status = "Budget Exceeded"
-        elif category and not matched_category:
-            recommendation_status = "Category Mismatch"
-        elif requirements and not all_specs_mentioned:
-            recommendation_status = "Specifications Unverified"
-        elif any(constraint["status"] != "Matched" for constraint in constraints):
-            recommendation_status = "Constraint Verification Pending"
-        elif match_type != "Exact Match":
-            recommendation_status = match_type
-        else:
-            recommendation_status = "Matches Requirements"
-
-        verification_status = (
-            "Currency Verification Pending" if has_budget and not currency_verified
-            else "Specifications Unverified" if requirements
-            else "Constraint Verification Pending" if not requested_constraints_satisfied
-            else "Verified"
-        )
-        ranking_tier = (
-            0 if exact_match
-            else 1 if (
-                relevant
-                and budget_eligible
-                and currency_verified
-                and category_eligible
-                and verification_status == "Verified"
-            )
-            else 2 if relevant and budget_matches is False
-            else 3
-        )
-        exchange_rate = converted_total["rate"] if converted_total else None
-        exchange_rate_date = converted_total["date"] if converted_total else None
-        enriched.append({
-            "product": product,
-            "analysis": {
-                "percentage": percentage,
-                "matchType": match_type,
-                "rankingTier": ranking_tier,
-                "nameRelevance": round(name_relevance, 4),
-                "nameMatched": requested_name_matched,
-                "requestedBrand": requested_brands[0] if requested_brands else None,
-                "brandMatched": brand_matched,
-                "preferredBrandMatched": preferred_brand_matched if preferred_brands else None,
-                "brandMatchStatus": (
-                    "Matched" if brand_matched is True
-                    else "Not matched" if brand_matched is False
-                    else "Not requested" if not requested_brands
-                    else "Not available for verification"
-                ),
-                "verificationStatus": verification_status,
-                "categoryMatched": matched_category,
-                "specificationsMatched": all_specs_mentioned if requirements else None,
-                "budgetMatched": budget_matches,
-                "budgetCurrency": currency if has_budget else None,
-                "budgetAmount": float(budget_decimal) if has_budget else None,
-                "cataloguePrice": float(price_decimal) if price_is_valid else None,
-                "catalogueCurrency": product_currency,
-                "convertedPrice": converted_price["amount"] if converted_price else None,
-                "convertedShipping": converted_shipping["amount"] if converted_shipping else None,
-                "convertedTax": converted_tax["amount"] if converted_tax else None,
-                "comparableTotal": comparison_amount,
-                "comparisonCurrency": currency,
-                "exchangeRate": exchange_rate,
-                "exchangeRateBase": product_currency,
-                "exchangeRateQuote": currency,
-                "exchangeRateDate": exchange_rate_date,
-                "matches": matches,
-                "constraints": constraints,
-                "status": recommendation_status,
-            },
-        })
-
-    status_priority = {
-        "Matches Requirements": 0,
-        "Specifications Unverified": 1,
-        "Budget Exceeded": 2,
-        "Exchange Rate Unavailable": 3,
-        "Category Mismatch": 4,
-    }
-    enriched.sort(
-        key=lambda item: (
-            item["analysis"]["rankingTier"],
-            status_priority.get(item["analysis"]["status"], 5),
-            -item["analysis"]["percentage"],
-        ),
-    )
-
-    add_audit(
-        user["id"],
-        "Product API data retrieved",
-        f"Retrieved {len(enriched)} relevant recommendation product(s).",
-    )
-
+    from app.services.recommendation_service import recommendation_service
+    rec_result = await recommendation_service.get_recommendations(intent_data=intent, limit=100)
+    add_audit(user["id"], "Product API data retrieved", f"Retrieved {rec_result.total} recommendation product(s).")
     return {
-        "recommendations": enriched,
-        "total": len(enriched),
-        "message": (
-            None if enriched
-            else (
-                "No products matched all mandatory requirements"
-                + (
-                    f": {', '.join(sorted(rejection_reasons))}"
-                    if rejection_reasons
-                    else "."
-                )
-                + " No requirements were relaxed."
-            )
-        ),
+        "total": rec_result.total,
+        "recommendations": [
+            {
+                "product": r.product,
+                "analysis": r.analysis,
+                "score": r.score,
+                "is_fully_matching": r.is_fully_matching,
+                "recommendation_reason": r.recommendation_reason,
+            }
+            for r in rec_result.recommendations
+        ],
     }
 
 
-@app.get("/api/cart")
+# Legacy cart routes moved to cart_router
+@app.get("/api/legacy-cart")
 async def get_cart(user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
     items = await current_cart(user["id"])
     return {"items": items, "totals": cart_price(items)}
 
 
-@app.post("/api/cart/items")
+@app.post("/api/legacy-cart/items")
 async def add_cart_item(
     payload: CartItemRequest,
     user: dict[str, Any] = Depends(get_current_user),
@@ -2550,7 +1409,7 @@ async def add_cart_item(
     return await get_cart(user)
 
 
-@app.put("/api/cart/items/{product_id}")
+@app.put("/api/legacy-cart/items/{product_id}")
 async def update_cart_item(
     product_id: int,
     payload: CartQuantityRequest,
@@ -2567,7 +1426,7 @@ async def update_cart_item(
     return await get_cart(user)
 
 
-@app.delete("/api/cart/items/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete("/api/legacy-cart/items/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_cart_item(product_id: int, user: dict[str, Any] = Depends(get_current_user)) -> None:
     with connect() as connection:
         connection.execute(
@@ -2577,14 +1436,14 @@ def delete_cart_item(product_id: int, user: dict[str, Any] = Depends(get_current
     add_audit(user["id"], "Cart changed", f"Removed product {product_id} from the cart.")
 
 
-@app.delete("/api/cart/items", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete("/api/legacy-cart/items", status_code=status.HTTP_204_NO_CONTENT)
 def clear_cart(user: dict[str, Any] = Depends(get_current_user)) -> None:
     with connect() as connection:
         connection.execute("DELETE FROM cart_items WHERE user_id = ?", (user["id"],))
     add_audit(user["id"], "Cart cleared", "Cleared cart after a completed purchase.")
 
 
-@app.post("/api/orders", status_code=status.HTTP_201_CREATED)
+@app.post("/api/legacy-orders", status_code=status.HTTP_201_CREATED)
 async def create_order(
     payload: OrderRequest,
     user: dict[str, Any] = Depends(get_current_user),
@@ -2617,7 +1476,8 @@ async def create_order(
     }
 
 
-@app.post("/api/verification/order")
+# /api/verification/order moved to verification_router
+@app.post("/api/legacy-verification/order")
 async def verify_order(
     payload: VerifyOrderRequest,
     user: dict[str, Any] = Depends(get_current_user),
@@ -2671,7 +1531,7 @@ async def verify_order(
     return {"order_id": payload.order_id, **checks}
 
 
-@app.post("/api/approvals/{order_id}/approve")
+@app.post("/api/legacy-approvals/{order_id}/approve")
 async def approve_order(
     order_id: str,
     payload: ApprovalRequest,
@@ -2692,7 +1552,7 @@ async def approve_order(
     return {"order_id": order_id, "order_version": payload.order_version, "status": "approved"}
 
 
-@app.post("/api/payments/create-order")
+@app.post("/api/legacy-payments/create-order")
 async def create_payment_order(
     payload: VerifyOrderRequest,
     user: dict[str, Any] = Depends(get_current_user),
@@ -2997,7 +1857,7 @@ async def create_payment_order(
     }
 
 
-@app.post("/api/payments/capture-order")
+@app.post("/api/legacy-payments/capture-order")
 async def capture_payment(
     payload: PayPalCaptureRequest,
     user: dict[str, Any] = Depends(get_current_user),

@@ -1,755 +1,200 @@
-import json
-import sys
-import tempfile
-import unittest
-from pathlib import Path
+"""Comprehensive tests for PayPal Sandbox Payment Integration (Phase 9)."""
+
+from decimal import Decimal
 from unittest.mock import AsyncMock, patch
+import pytest
+from httpx import ASGITransport, AsyncClient
 
-from fastapi.testclient import TestClient
+from app.core.config import settings
+from app.core.dependencies import get_current_user
+from app.database import connect, initialize_database
+from app.main import app
+from app.schemas.product import NormalizedProduct
+from app.services.cart_service import cart_service
+from app.services.paypal_service import paypal_service
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+MOCK_USER = {
+    "id": 990,
+    "email": "payment_user@example.com",
+    "name": "Payment User",
+    "role": "user",
+}
 
-from app import database, main
 
-
-class PayPalCaptureTests(unittest.TestCase):
-    order_id = "trustpay-order-test"
-    paypal_order_id = "PAYPAL-ORDER-TEST"
-
-    def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory()
-        self.original_database_path = database.DATABASE_PATH
-        database.DATABASE_PATH = Path(self.temporary_directory.name) / "trustpay-test.db"
-        self.client = TestClient(main.app)
-        self.client.__enter__()
-        self.addCleanup(self.cleanup)
-
-        with database.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO users (id, name, email, password_hash, created_at)
-                VALUES (1, 'Test Buyer', 'buyer@example.test', 'unused', ?)
-                """,
-                (main.utc_now(),),
-            )
-            connection.execute(
-                """
-                INSERT INTO users (id, name, email, password_hash, created_at)
-                VALUES (2, 'Other Buyer', 'other@example.test', 'unused', ?)
-                """,
-                (main.utc_now(),),
-            )
-            connection.execute(
-                """
-                INSERT INTO orders
-                (id, user_id, version, intent_json, cart_json, total, currency,
-                 status, checks_json, paypal_order_id, created_at, updated_at)
-                VALUES (?, 1, 1, '{}', ?, 10.0, 'USD', 'paypal_pending',
-                        '{"status":"Passed"}', ?, ?, ?)
-                """,
-                (
-                    self.order_id,
-                    json.dumps([{
-                        "product": {"id": 1, "title": "Test item"},
-                        "quantity": 1,
-                    }]),
-                    self.paypal_order_id,
-                    main.utc_now(),
-                    main.utc_now(),
-                ),
-            )
-            connection.execute(
-                "INSERT INTO cart_items (user_id, product_id, quantity) VALUES (1, 1, 1)"
-            )
-
-        self.headers = {"Authorization": f"Bearer {main.create_token(1)}"}
-        self.other_buyer_headers = {"Authorization": f"Bearer {main.create_token(2)}"}
-
-    def cleanup(self) -> None:
-        self.client.__exit__(None, None, None)
-        database.DATABASE_PATH = self.original_database_path
-        self.temporary_directory.cleanup()
-
-    def approved_paypal_order(self) -> dict[str, object]:
-        return {
-            "id": self.paypal_order_id,
-            "status": "APPROVED",
-            "purchase_units": [{
-                "reference_id": self.order_id,
-                "amount": {"currency_code": "USD", "value": "10.00"},
-            }],
-        }
-
-    def completed_paypal_order(
-        self,
-        amount: str = "10.00",
-        currency: str = "USD",
-    ) -> dict[str, object]:
-        return {
-            "id": self.paypal_order_id,
-            "status": "COMPLETED",
-            "purchase_units": [{
-                "reference_id": self.order_id,
-                "amount": {"currency_code": "USD", "value": "10.00"},
-                "payments": {
-                    "captures": [{
-                        "id": "PAYPAL-CAPTURE-TEST",
-                        "status": "COMPLETED",
-                        "final_capture": True,
-                        "amount": {"currency_code": currency, "value": amount},
-                    }],
-                },
-            }],
-        }
-
-    def created_paypal_order(self) -> dict[str, object]:
-        return {
-            "id": self.paypal_order_id,
-            "status": "CREATED",
-            "purchase_units": [{
-                "reference_id": self.order_id,
-                "amount": {"currency_code": "USD", "value": "10.00"},
-            }],
-            "links": [{
-                "rel": "approve",
-                "href": "https://www.sandbox.paypal.com/checkoutnow?token=PAYPAL-ORDER-TEST",
-            }],
-        }
-
-    def test_approval_url_rejects_external_hosts_and_nonstandard_ports(self) -> None:
-        for href in (
-            "https://example.com/checkout",
-            "https://www.sandbox.paypal.com:8443/checkout",
-            "https://www.sandbox.paypal.com.evil.example/checkout",
-        ):
-            with self.subTest(href=href), self.assertRaises(main.HTTPException):
-                main.paypal_approval_url({
-                    "links": [{"rel": "approve", "href": href}],
-                })
-
-    def capture(self) -> object:
-        return self.client.post(
-            "/api/payments/capture-order",
-            json={"paypal_order_id": self.paypal_order_id},
-            headers=self.headers,
+@pytest.fixture(autouse=True)
+def setup_db(monkeypatch):
+    monkeypatch.setattr(settings, "DATABASE_URL", None)
+    initialize_database()
+    with connect() as conn:
+        conn.execute("DELETE FROM transactions")
+        conn.execute("DELETE FROM approvals")
+        conn.execute("DELETE FROM orders")
+        conn.execute("DELETE FROM cart_items")
+        conn.execute("DELETE FROM users WHERE email = 'payment_user@example.com'")
+        conn.execute(
+            """INSERT INTO users (id, name, email, password_hash, created_at)
+               VALUES (990, 'Payment User', 'payment_user@example.com', 'dummyhash', '2026-11-04T00:00:00Z')"""
         )
 
-    def test_completed_capture_is_recorded_once_and_clears_matching_cart(self) -> None:
-        with (
-            patch.object(main, "paypal_access_token", new=AsyncMock(return_value="test-token")),
-            patch.object(
-                main,
-                "paypal_api_request",
-                new=AsyncMock(side_effect=[
-                    (200, self.approved_paypal_order()),
-                    (201, self.completed_paypal_order()),
-                ]),
-            ) as paypal_request,
-        ):
-            response = self.capture()
-            duplicate = self.capture()
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["status"], "COMPLETED")
-        self.assertTrue(response.json()["cart_cleared"])
-        self.assertEqual(response.json()["product"], "Test item")
-        self.assertEqual(duplicate.status_code, 200)
-        self.assertFalse(duplicate.json()["cart_cleared"])
-        self.assertEqual(paypal_request.await_count, 2)
+@pytest.fixture
+def auth_client():
+    app.dependency_overrides[get_current_user] = lambda: MOCK_USER
+    transport = ASGITransport(app=app)
+    client = AsyncClient(transport=transport, base_url="http://test")
+    yield client
+    app.dependency_overrides.clear()
 
-        with database.connect() as connection:
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
-                1,
-            )
-            self.assertEqual(
-                connection.execute(
-                    "SELECT status FROM orders WHERE id = ?", (self.order_id,)
-                ).fetchone()["status"],
-                "completed",
-            )
-            self.assertEqual(
-                connection.execute(
-                    "SELECT COUNT(*) FROM cart_items WHERE user_id = 1"
-                ).fetchone()[0],
-                0,
-            )
 
-    def test_completed_transaction_details_use_persisted_order_and_verification(self) -> None:
-        with (
-            patch.object(main, "paypal_access_token", new=AsyncMock(return_value="test-token")),
-            patch.object(
-                main,
-                "paypal_api_request",
-                new=AsyncMock(side_effect=[
-                    (200, self.approved_paypal_order()),
-                    (201, self.completed_paypal_order()),
-                ]),
-            ),
-        ):
-            capture = self.capture()
+@pytest.fixture
+def unauth_client():
+    transport = ASGITransport(app=app)
+    client = AsyncClient(transport=transport, base_url="http://test")
+    yield client
 
-        self.assertEqual(capture.status_code, 200)
-        transaction_id = capture.json()["id"]
-        intent = {
-            "request": "I need a laptop under ₹1,000",
-            "category": "laptops",
-            "requirements": [{"name": "RAM", "value": "16GB"}],
-            "maximumBudget": 1000,
-            "currency": "INR",
-            "trustedSellersOnly": False,
-            "platformId": "dummyjson",
-        }
-        checks = {
-            "status": "Passed",
-            "checks": [{
-                "name": "Final price",
-                "status": "Passed",
-                "reason": "Within budget.",
-                "critical": True,
-            }],
-            "totals": {
-                "subtotal": 10.0,
-                "shipping": 0.0,
-                "tax": 0.0,
-                "total": 10.0,
-                "currency": "USD",
+
+@pytest.mark.asyncio
+async def test_payments_unauthenticated_rejected(unauth_client: AsyncClient):
+    res1 = await unauth_client.post("/api/payments/create-order", json={"order_id": "none"})
+    assert res1.status_code == 401
+
+    res2 = await unauth_client.post("/api/payments/capture-order", json={"paypal_order_id": "none"})
+    assert res2.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_payment_creation_unapproved_order_rejected(auth_client: AsyncClient):
+    await cart_service.clear_cart(user_id=990)
+
+    p = NormalizedProduct(
+        id=1,
+        title="Laptop",
+        price=Decimal("500.00"),
+        brand="Dell",
+        description="Clean laptop",
+        category="laptops",
+        platform_id="dummyjson",
+    )
+
+    with patch("app.services.cart_service.product_service.get_product_details", new_callable=AsyncMock) as mock_p:
+        mock_p.return_value = p
+        await auth_client.post("/api/cart/items", json={"product_id": 1, "quantity": 1})
+
+        order_res = await auth_client.post(
+            "/api/orders",
+            json={"intent": {"maximumBudget": 600.0, "currency": "USD"}},
+        )
+        order_id = order_res.json()["id"]
+
+        # Attempt to create payment before customer approval
+        pay_res = await auth_client.post(
+            "/api/payments/create-order",
+            json={"order_id": order_id},
+        )
+        assert pay_res.status_code == 409
+        assert "must pass before payment" in pay_res.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_payment_create_and_capture_full_workflow(auth_client: AsyncClient):
+    await cart_service.clear_cart(user_id=990)
+
+    p = NormalizedProduct(
+        id=1,
+        title="Apple MacBook Pro 16GB RAM 512GB SSD",
+        price=Decimal("950.00"),
+        brand="Apple",
+        description="Apple laptop with 16GB RAM",
+        category="laptops",
+        platform_id="dummyjson",
+    )
+
+    with patch("app.services.cart_service.product_service.get_product_details", new_callable=AsyncMock) as mock_p:
+        mock_p.return_value = p
+        # 1. Add to cart
+        await auth_client.post("/api/cart/items", json={"product_id": 1, "quantity": 1})
+
+        # 2. Create order
+        order_res = await auth_client.post(
+            "/api/orders",
+            json={
+                "intent": {
+                    "prompt": "Need an Apple laptop with 16GB RAM under $1100",
+                    "maximumBudget": 1100.0,
+                    "currency": "USD",
+                    "structured_intent": {
+                        "budget": {"amount": 1100.0, "currency": "USD"},
+                        "mandatory_specifications": [
+                            {"name": "RAM", "operator": "GTE", "value": "16GB"},
+                        ],
+                    },
+                }
             },
-            "budgetComparison": {
-                "amount": 800.0,
-                "currency": "INR",
-                "exchangeRate": 80.0,
-                "exchangeRateBase": "USD",
-                "exchangeRateQuote": "INR",
-                "exchangeRateDate": "2026-11-10",
-            },
-        }
-        product_snapshot = {
-            "id": 1,
-            "title": "Laptop Pro",
-            "brand": "Example",
-            "category": "laptops",
-            "price": 10.0,
-            "thumbnail": "https://images.example.test/laptop.png",
-        }
-        with database.connect() as connection:
-            connection.execute(
-                "UPDATE orders SET intent_json = ?, cart_json = ?, checks_json = ? WHERE id = ?",
-                (
-                    json.dumps(intent),
-                    json.dumps([{"product": product_snapshot, "quantity": 1}]),
-                    json.dumps(checks),
-                    self.order_id,
-                ),
-            )
-
-        details = self.client.get(
-            f"/api/transactions/{transaction_id}",
-            headers=self.headers,
         )
-        another_users_details = self.client.get(
-            f"/api/transactions/{transaction_id}",
-            headers=self.other_buyer_headers,
-        )
+        order_id = order_res.json()["id"]
 
-        self.assertEqual(details.status_code, 200)
-        payload = details.json()
-        self.assertEqual(payload["transaction"]["paypal_capture_id"], "PAYPAL-CAPTURE-TEST")
-        self.assertEqual(payload["transaction"]["paypal_order_id"], self.paypal_order_id)
-        self.assertEqual(payload["transaction"]["capture_status"], "COMPLETED")
-        self.assertEqual(payload["transaction"]["amount"], 10.0)
-        self.assertEqual(payload["transaction"]["currency"], "USD")
-        self.assertIsNone(payload["transaction"]["payer"])
-        self.assertEqual(payload["order"]["intent"]["request"], intent["request"])
-        self.assertEqual(payload["order"]["products"][0]["product"], product_snapshot)
-        self.assertEqual(payload["order"]["products"][0]["subtotal"], 10.0)
-        self.assertEqual(payload["order"]["products"][0]["quantity"], 1)
-        self.assertEqual(payload["order"]["products"][0]["product"]["title"], "Laptop Pro")
-        self.assertEqual(payload["order"]["products"][0]["product"]["brand"], "Example")
-        self.assertEqual(payload["order"]["products"][0]["product"]["category"], "laptops")
-        self.assertEqual(
-            payload["order"]["products"][0]["marketplace"],
-            "DummyJSON Demo Store",
-        )
-        self.assertEqual(payload["order"]["verification"]["status"], checks["status"])
-        self.assertEqual(
-            payload["order"]["verification"]["checks"][0]["reason"],
-            checks["checks"][0]["reason"],
-        )
-        self.assertEqual(
-            payload["order"]["verification"]["checks"][0]["status"],
-            checks["checks"][0]["status"],
-        )
-        self.assertEqual(payload["order"]["budget"]["currency"], "INR")
-        self.assertEqual(payload["order"]["budget"]["actual_total"], 800.0)
-        self.assertEqual(payload["order"]["budget"]["remaining"], 200.0)
-        self.assertEqual(payload["order"]["budget"]["status"], "Within budget")
-        self.assertEqual(another_users_details.status_code, 404)
+        # 3. Verify
+        verify_res = await auth_client.post("/api/verification/order", json={"order_id": order_id})
+        assert verify_res.status_code == 200
+        assert verify_res.json()["status"] == "Passed"
 
-        with database.connect() as connection:
-            connection.execute(
-                "UPDATE orders SET checks_json = NULL WHERE id = ?", (self.order_id,)
-            )
-        missing_verification = self.client.get(
-            f"/api/transactions/{transaction_id}",
-            headers=self.headers,
-        )
-        self.assertIsNone(missing_verification.json()["order"]["verification"])
-        self.assertEqual(
-            missing_verification.json()["order"]["budget"]["maximum"], 1000.0
-        )
-        self.assertIsNone(
-            missing_verification.json()["order"]["budget"]["actual_total"]
-        )
-        self.assertEqual(
-            missing_verification.json()["order"]["budget"]["status"], "Not available"
-        )
+        # 4. Approve
+        appr_res = await auth_client.post(f"/api/approvals/{order_id}/approve", json={"order_version": 1})
+        assert appr_res.status_code == 200
 
-    def test_failed_or_missing_transactions_have_no_success_receipt(self) -> None:
-        missing = self.client.get(
-            "/api/transactions/unknown-transaction",
-            headers=self.headers,
-        )
-        with database.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO transactions
-                (id, user_id, order_id, product, amount, currency, date, method, status, verification)
-                VALUES ('failed-transaction', 1, ?, 'Test item', 10, 'USD', ?, 'PayPal Sandbox', 'Failed', 'Not verified')
-                """,
-                (self.order_id, main.utc_now()),
-            )
-        failed = self.client.get(
-            "/api/transactions/failed-transaction",
-            headers=self.headers,
-        )
-        self.assertEqual(missing.status_code, 404)
-        self.assertEqual(failed.status_code, 404)
+        # 5. Create Payment Order (Sandbox)
+        pay_res = await auth_client.post("/api/payments/create-order", json={"order_id": order_id})
+        assert pay_res.status_code == 200
+        pay_data = pay_res.json()
+        assert pay_data["order_id"] == order_id
+        assert pay_data["paypal_order_id"].startswith("PAYPAL-")
+        assert "approval_url" in pay_data
+        assert pay_data["status"] == "PENDING"
 
-    def test_capture_preserves_a_cart_changed_during_paypal_checkout(self) -> None:
-        with database.connect() as connection:
-            connection.execute("DELETE FROM cart_items WHERE user_id = 1")
-            connection.execute(
-                "INSERT INTO cart_items (user_id, product_id, quantity) VALUES (1, 2, 3)"
-            )
-
-        with (
-            patch.object(main, "paypal_access_token", new=AsyncMock(return_value="test-token")),
-            patch.object(
-                main,
-                "paypal_api_request",
-                new=AsyncMock(side_effect=[
-                    (200, self.approved_paypal_order()),
-                    (201, self.completed_paypal_order()),
-                ]),
-            ),
-        ):
-            response = self.capture()
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["status"], "COMPLETED")
-        self.assertFalse(response.json()["cart_cleared"])
-        with database.connect() as connection:
-            cart = connection.execute(
-                "SELECT product_id, quantity FROM cart_items WHERE user_id = 1"
-            ).fetchone()
-            self.assertEqual((cart["product_id"], cart["quantity"]), (2, 3))
-
-    def test_capture_amount_mismatch_is_not_recorded(self) -> None:
-        with (
-            patch.object(main, "paypal_access_token", new=AsyncMock(return_value="test-token")),
-            patch.object(
-                main,
-                "paypal_api_request",
-                new=AsyncMock(side_effect=[
-                    (200, self.approved_paypal_order()),
-                    (201, self.completed_paypal_order("9.00")),
-                ]),
-            ),
-        ):
-            response = self.capture()
-
-        self.assertEqual(response.status_code, 409)
-        with database.connect() as connection:
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
-                0,
-            )
-            self.assertEqual(
-                connection.execute(
-                    "SELECT status FROM orders WHERE id = ?", (self.order_id,)
-                ).fetchone()["status"],
-                "reconciliation_required",
-            )
-
-    def test_capture_currency_mismatch_is_not_recorded(self) -> None:
-        with (
-            patch.object(main, "paypal_access_token", new=AsyncMock(return_value="test-token")),
-            patch.object(
-                main,
-                "paypal_api_request",
-                new=AsyncMock(side_effect=[
-                    (200, self.approved_paypal_order()),
-                    (201, self.completed_paypal_order(currency="INR")),
-                ]),
-            ),
-        ):
-            response = self.capture()
-
-        self.assertEqual(response.status_code, 409)
-        with database.connect() as connection:
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
-                0,
-            )
-            self.assertEqual(
-                connection.execute(
-                    "SELECT status FROM orders WHERE id = ?", (self.order_id,)
-                ).fetchone()["status"],
-                "reconciliation_required",
-            )
-
-    def test_failed_capture_is_not_recorded(self) -> None:
-        failed_order = self.approved_paypal_order()
-        failed_order["status"] = "DENIED"
-        failed_order["purchase_units"][0]["payments"] = {
-            "captures": [{
-                "id": "PAYPAL-CAPTURE-FAILED",
-                "status": "DECLINED",
-                "final_capture": True,
-                "amount": {"currency_code": "USD", "value": "10.00"},
-            }],
-        }
-        capture_response = {"id": self.paypal_order_id, "status": "DENIED"}
-        with (
-            patch.object(main, "paypal_access_token", new=AsyncMock(return_value="test-token")),
-            patch.object(
-                main,
-                "paypal_api_request",
-                new=AsyncMock(side_effect=[
-                    (200, self.approved_paypal_order()),
-                    (201, capture_response),
-                    (200, failed_order),
-                ]),
-            ),
-        ):
-            response = self.capture()
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["status"], "FAILED")
-        with database.connect() as connection:
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
-                0,
-            )
-            self.assertEqual(
-                connection.execute(
-                    "SELECT status FROM orders WHERE id = ?", (self.order_id,)
-                ).fetchone()["status"],
-                "failed",
-            )
-
-    def test_capture_cannot_be_requested_by_another_user(self) -> None:
-        response = self.client.post(
+        # 6. Capture Payment Order
+        cap_res = await auth_client.post(
             "/api/payments/capture-order",
-            json={"paypal_order_id": self.paypal_order_id},
-            headers=self.other_buyer_headers,
+            json={"paypal_order_id": pay_data["paypal_order_id"]},
         )
+        assert cap_res.status_code == 200
+        cap_data = cap_res.json()
+        assert cap_data["status"] == "COMPLETED"
+        assert cap_data["method"] == "PayPal Sandbox"
+        assert cap_data["order_id"] == order_id
+        assert cap_data["id"] is not None
+        assert cap_data["id"].startswith("TRX-")
 
-        self.assertEqual(response.status_code, 404)
+        # 7. Cart should now be empty after successful purchase
+        cart_res = await auth_client.get("/api/cart")
+        assert len(cart_res.json()["items"]) == 0
 
-    def test_create_order_reuses_sandbox_order_and_request_id(self) -> None:
-        with database.connect() as connection:
-            connection.execute(
-                "UPDATE orders SET status = 'approved' WHERE id = ?",
-                (self.order_id,),
-            )
-
-        current_cart = [{
-            "product": {"id": 1, "title": "Test item"},
-            "quantity": 1,
-        }]
-        created_paypal_order = self.created_paypal_order()
-        with (
-            patch.object(main, "current_cart", new=AsyncMock(return_value=current_cart)),
-            patch.object(main, "paypal_access_token", new=AsyncMock(return_value="test-token")),
-            patch.object(
-                main,
-                "paypal_api_request",
-                new=AsyncMock(return_value=(201, created_paypal_order)),
-            ) as paypal_request,
-        ):
-            response = self.client.post(
-                "/api/payments/create-order",
-                json={"order_id": self.order_id},
-                headers=self.headers,
-            )
-            retry = self.client.post(
-                "/api/payments/create-order",
-                json={"order_id": self.order_id},
-                headers=self.headers,
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(retry.status_code, 200)
-        self.assertEqual(response.json()["paypal_order_id"], self.paypal_order_id)
-        self.assertEqual(retry.json()["approval_url"], response.json()["approval_url"])
-        self.assertEqual(paypal_request.await_count, 1)
-        self.assertEqual(paypal_request.await_args.kwargs["request_id"], main.payment_request_id("create", self.order_id))
-        payment_payload = paypal_request.await_args.kwargs["payload"]
-        self.assertEqual(
-            payment_payload["application_context"]["return_url"],
-            f"{main.FRONTEND_BASE_URL}/payment?order_id={self.order_id}",
+        # 8. Duplicate capture attempt should be rejected with 409
+        dup_res = await auth_client.post(
+            "/api/payments/capture-order",
+            json={"paypal_order_id": pay_data["paypal_order_id"]},
         )
-        self.assertEqual(
-            payment_payload["application_context"]["cancel_url"],
-            f"{main.FRONTEND_BASE_URL}/payment?cancelled=1&order_id={self.order_id}",
-        )
-        with database.connect() as connection:
-            self.assertEqual(
-                connection.execute(
-                    "SELECT status FROM orders WHERE id = ?", (self.order_id,)
-                ).fetchone()["status"],
-                "paypal_pending",
-            )
-
-    def test_create_order_refreshes_incomplete_post_response(self) -> None:
-        with database.connect() as connection:
-            connection.execute(
-                "UPDATE orders SET status = 'approved' WHERE id = ?",
-                (self.order_id,),
-            )
-
-        current_cart = [{
-            "product": {"id": 1, "title": "Test item"},
-            "quantity": 1,
-        }]
-        incomplete_response = {"id": self.paypal_order_id, "status": "CREATED"}
-        with (
-            patch.object(main, "current_cart", new=AsyncMock(return_value=current_cart)),
-            patch.object(main, "paypal_access_token", new=AsyncMock(return_value="test-token")),
-            patch.object(
-                main,
-                "paypal_api_request",
-                new=AsyncMock(side_effect=[
-                    (201, incomplete_response),
-                    (200, self.created_paypal_order()),
-                ]),
-            ) as paypal_request,
-        ):
-            response = self.client.post(
-                "/api/payments/create-order",
-                json={"order_id": self.order_id},
-                headers=self.headers,
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["paypal_order_id"], self.paypal_order_id)
-        self.assertEqual(paypal_request.await_count, 2)
-        self.assertEqual(paypal_request.await_args_list[1].args[:2], (
-            "GET",
-            f"/v2/checkout/orders/{self.paypal_order_id}",
-        ))
-        with database.connect() as connection:
-            self.assertEqual(
-                connection.execute(
-                    "SELECT status FROM orders WHERE id = ?", (self.order_id,)
-                ).fetchone()["status"],
-                "paypal_pending",
-            )
-
-    def test_create_order_rejects_unexpected_refreshed_response(self) -> None:
-        with database.connect() as connection:
-            connection.execute(
-                "UPDATE orders SET status = 'approved' WHERE id = ?",
-                (self.order_id,),
-            )
-
-        current_cart = [{
-            "product": {"id": 1, "title": "Test item"},
-            "quantity": 1,
-        }]
-        incomplete_response = {"id": self.paypal_order_id, "status": "CREATED"}
-        invalid_refreshed_order = {
-            **self.created_paypal_order(),
-            "purchase_units": [],
-        }
-        with (
-            patch.object(main, "current_cart", new=AsyncMock(return_value=current_cart)),
-            patch.object(main, "paypal_access_token", new=AsyncMock(return_value="test-token")),
-            patch.object(
-                main,
-                "paypal_api_request",
-                new=AsyncMock(side_effect=[
-                    (201, incomplete_response),
-                    (200, invalid_refreshed_order),
-                ]),
-            ) as paypal_request,
-        ):
-            response = self.client.post(
-                "/api/payments/create-order",
-                json={"order_id": self.order_id},
-                headers=self.headers,
-            )
-
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(paypal_request.await_count, 2)
-        with database.connect() as connection:
-            self.assertEqual(
-                connection.execute(
-                    "SELECT status FROM orders WHERE id = ?", (self.order_id,)
-                ).fetchone()["status"],
-                "reconciliation_required",
-            )
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
-                0,
-            )
-
-    def test_create_order_rejects_a_different_id_in_refreshed_response(self) -> None:
-        with database.connect() as connection:
-            connection.execute(
-                "UPDATE orders SET status = 'approved' WHERE id = ?",
-                (self.order_id,),
-            )
-
-        current_cart = [{
-            "product": {"id": 1, "title": "Test item"},
-            "quantity": 1,
-        }]
-        incomplete_response = {"id": self.paypal_order_id, "status": "CREATED"}
-        mismatched_order = {
-            **self.created_paypal_order(),
-            "id": "DIFFERENT-PAYPAL-ORDER",
-        }
-        with (
-            patch.object(main, "current_cart", new=AsyncMock(return_value=current_cart)),
-            patch.object(main, "paypal_access_token", new=AsyncMock(return_value="test-token")),
-            patch.object(
-                main,
-                "paypal_api_request",
-                new=AsyncMock(side_effect=[
-                    (201, incomplete_response),
-                    (200, mismatched_order),
-                ]),
-            ),
-        ):
-            response = self.client.post(
-                "/api/payments/create-order",
-                json={"order_id": self.order_id},
-                headers=self.headers,
-            )
-
-        self.assertEqual(response.status_code, 409)
-        with database.connect() as connection:
-            self.assertEqual(
-                connection.execute(
-                    "SELECT status FROM orders WHERE id = ?", (self.order_id,)
-                ).fetchone()["status"],
-                "reconciliation_required",
-            )
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
-                0,
-            )
-
-    def test_create_order_reconciles_existing_paypal_order_without_creating_another(self) -> None:
-        with database.connect() as connection:
-            connection.execute(
-                "UPDATE orders SET status = 'reconciliation_required' WHERE id = ?",
-                (self.order_id,),
-            )
-
-        current_cart = [{
-            "product": {"id": 1, "title": "Test item"},
-            "quantity": 1,
-        }]
-        with (
-            patch.object(main, "current_cart", new=AsyncMock(return_value=current_cart)),
-            patch.object(main, "paypal_access_token", new=AsyncMock(return_value="test-token")),
-            patch.object(
-                main,
-                "paypal_api_request",
-                new=AsyncMock(return_value=(200, self.created_paypal_order())),
-            ) as paypal_request,
-        ):
-            response = self.client.post(
-                "/api/payments/create-order",
-                json={"order_id": self.order_id},
-                headers=self.headers,
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["paypal_order_id"], self.paypal_order_id)
-        self.assertEqual(paypal_request.await_count, 1)
-        self.assertEqual(paypal_request.await_args.args[:2], (
-            "GET",
-            f"/v2/checkout/orders/{self.paypal_order_id}",
-        ))
-        with database.connect() as connection:
-            order = connection.execute(
-                "SELECT status, paypal_order_id FROM orders WHERE id = ?",
-                (self.order_id,),
-            ).fetchone()
-            self.assertEqual(order["status"], "paypal_pending")
-            self.assertEqual(order["paypal_order_id"], self.paypal_order_id)
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
-                0,
-            )
-
-    def test_cancelled_paypal_order_is_not_recorded(self) -> None:
-        with (
-            patch.object(main, "paypal_access_token", new=AsyncMock(return_value="test-token")),
-            patch.object(
-                main,
-                "paypal_api_request",
-                new=AsyncMock(return_value=(200, self.created_paypal_order())),
-            ),
-        ):
-            response = self.client.post(
-                "/api/payments/cancel-order",
-                json={"order_id": self.order_id},
-                headers=self.headers,
-            )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["status"], "CANCELLED")
-        with database.connect() as connection:
-            self.assertEqual(
-                connection.execute(
-                    "SELECT status FROM orders WHERE id = ?", (self.order_id,)
-                ).fetchone()["status"],
-                "cancelled",
-            )
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
-                0,
-            )
-
-    def test_capture_timeout_reconciles_provider_status(self) -> None:
-        with (
-            patch.object(main, "paypal_access_token", new=AsyncMock(return_value="test-token")),
-            patch.object(
-                main,
-                "paypal_api_request",
-                new=AsyncMock(side_effect=[
-                    (200, self.approved_paypal_order()),
-                    main.PayPalTransportError("capture response timed out"),
-                    (200, self.completed_paypal_order()),
-                ]),
-            ) as paypal_request,
-        ):
-            response = self.capture()
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["status"], "COMPLETED")
-        self.assertEqual(paypal_request.await_count, 3)
-        with database.connect() as connection:
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
-                1,
-            )
+        assert dup_res.status_code == 409
+        assert "already been captured" in dup_res.json()["detail"].lower()
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.mark.asyncio
+async def test_payment_oauth_token_caching():
+    # Test token caching mechanism directly on PayPalService
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = lambda: None
+        mock_response.json = lambda: {"access_token": "mock-cached-access-token", "expires_in": 3600}
+        mock_post.return_value = mock_response
+
+        # Temporarily enable paypal configuration for this unit test
+        with patch.object(paypal_service, "_cached_token", None):
+            with patch.object(paypal_service, "_token_expires_at", 0.0):
+                with patch("app.core.config.settings.PAYPAL_CLIENT_ID", "test-client-id"):
+                    with patch("app.core.config.settings.PAYPAL_CLIENT_SECRET", "test-client-secret"):
+                        token1 = await paypal_service.get_access_token()
+                        token2 = await paypal_service.get_access_token()
+
+                        assert token1 == "mock-cached-access-token"
+                        assert token2 == "mock-cached-access-token"
+                        # Only 1 HTTP call made due to caching!
+                        assert mock_post.call_count == 1

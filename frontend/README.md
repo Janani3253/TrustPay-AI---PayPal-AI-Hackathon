@@ -1,65 +1,40 @@
 # TrustPay AI — IntentLock
 
-TrustPay AI frontend for customer-intent verification. The React app connects to the FastAPI service in the repository's `backend` folder. Customers sign in, select a shopping platform, and then browse products from that platform. Only DummyJSON Demo Store is connected; Amazon, Flipkart, and Myntra are clearly marked unsupported.
+Responsive React/Vite frontend for the TrustPay AI customer-intent shopping and payment workflow. It uses the existing FastAPI service, keeps provider calls in typed services, and does not place marketplace or payment secrets in the browser.
 
 ## Run locally
 
-Start the backend first by following [`../backend/README.md`](../backend/README.md), then start the frontend:
+Start the backend using the instructions in [`../backend/README.md`](../backend/README.md). In a second PowerShell terminal:
 
 ```powershell
-cd frontend
-Copy-Item .env.example .env
+Set-Location frontend
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 npm install
 npm run dev
 ```
 
-Set `VITE_API_BASE_URL=http://localhost:8000` in `frontend\.env`. The centralized Axios client uses `/api` endpoints on that backend and attaches the backend-issued bearer token.
+Set `VITE_API_BASE_URL=http://localhost:8000` in `frontend\.env`. The shared Axios client appends `/api`, applies a timeout, and attaches the signed-in user's JWT. Do not put provider credentials in this file.
 
-Production checks:
+## Current integrations
 
-```sh
-npm run build
+- Login, registration, session restoration/logout, shopping intent, DummyJSON product search, recommendations, backend-authoritative cart totals, order verification, approval, PayPal Sandbox, transactions, and audit records use the existing FastAPI endpoints.
+- Product and category requests use the canonical `platform=dummyjson` query parameter and honor backend pagination.
+- DummyJSON is the only supported shopping platform. Amazon, Flipkart, and Myntra are unavailable; the frontend does not show them as connected or substitute Demo products for their unavailable catalogues.
+- Verification and approval are session-only frontend state backed by server checks; a refresh clears those indicators and requires verification and approval again.
+- PayPal Sandbox is available only when backend credentials exist; successful payment is shown only after backend-confirmed capture.
+
+See [`API_INTEGRATION.md`](./API_INTEGRATION.md) for the routes, payloads, and response shapes used by the frontend.
+
+## Quality checks
+
+```powershell
 npm run lint
+npm run build
 ```
 
-## Product API configuration
+## Project layout
 
-The backend proxies the configurable product source, defaulting to `https://dummyjson.com`. Set `DUMMYJSON_BASE_URL` in `backend\.env` to change it. The API client and typed mapping are isolated in `src/services/api.ts`, `src/services/backendService.ts`, and `src/services/productService.ts`.
-
-Products, descriptions, categories, ratings, images, brand/SKU/weight/dimensions when present, and catalogue prices come from DummyJSON. The original catalogue amount and currency are preserved. For supported USD/INR comparisons, the backend uses date-based Frankfurter rates (no more than seven days old) and converts the product price, estimated shipping, and estimated tax before comparing the final estimate with the customer's budget. The backend returns the conversion rate and date; if the rate is unavailable, the product is not treated as budget-compliant. Estimated shipping and tax use the same backend calculation as order verification. DummyJSON does not provide verified-seller information or many technical specifications, which are marked unavailable rather than inferred. API failures are shown explicitly; catalogue mock products are not substituted.
-
-## Frontend workflow
-
-1. Register or sign in; the backend issues a JWT.
-2. Select a shopping platform from the dashboard. Only DummyJSON Demo Store is selectable.
-3. Enter a shopping request and review the policy returned by the backend.
-4. Search recommendations and review backend-returned product status.
-5. Add products to the server-persisted cart and review the server-calculated estimated fees.
-6. Run backend IntentLock checks; failed critical checks block approval.
-7. Approve the exact backend order version.
-8. If configured, continue to PayPal Sandbox and let the backend create/capture the provider order.
-9. Review backend transaction history and audit-chain integrity.
-
-## Demo limitations
-
-- Authentication, intent extraction, cart, order verification, approval, transactions, and audit records use the FastAPI backend.
-- PayPal is a real provider Sandbox flow only when backend credentials are configured. Without them, the backend returns a configuration error; no fake successful payment is generated.
-- Seller identity and technical product specifications are not verified by the public catalogue API.
-- Passwords are PBKDF2-hashed and user/cart/order/transaction/audit data are stored in the local SQLite database. This local prototype is not a production identity or payment system.
-- Seller identity and technical product specifications are not supplied by DummyJSON and remain unverified.
-- Replace `TRUSTPAY_SECRET_KEY` and configure CORS and PayPal Sandbox credentials before sharing the backend beyond local development.
-
-## Structure
-
-- `src/pages/Pages.tsx` — landing, authentication, catalogue, request, checkout, transaction, and audit screens.
-- `src/components/` — reusable app navigation, branding, and dashboard components.
-- `src/context/AppContext.tsx` — shared authentication and shopping workflow state.
-- `src/services/` — typed API access and product mapping.
-- `src/types/` — shared API and application data types.
-- `src/utils/` — order snapshot utilities.
-- `../backend/app/` — FastAPI endpoints, SQLite persistence, JWT auth, order checks, and PayPal Sandbox integration.
-
-
-# Terminal 2 — frontend
-Set-Location frontend
-npm run dev
+- `src/pages/` — landing, auth, dashboard, product, request, order, verification, payment, transaction, and audit pages.
+- `src/context/` — authentication and shared shopping state.
+- `src/services/` — Axios client and typed API adapters.
+- `src/types/` — API and application data types.

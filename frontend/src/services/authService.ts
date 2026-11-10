@@ -34,6 +34,14 @@ export async function getCurrentUser(): Promise<DemoUser> {
   return response.data
 }
 
+export async function logout(): Promise<void> {
+  try {
+    await api.post('/auth/logout')
+  } finally {
+    clearAuthToken()
+  }
+}
+
 export function clearAuthToken(): void {
   localStorage.removeItem(accessTokenKey)
 }
