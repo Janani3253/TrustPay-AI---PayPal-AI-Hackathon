@@ -7,8 +7,6 @@ import {
 } from 'lucide-react'
 import { Brand } from '../common/Brand'
 import { useApp } from '../../context/AppContext'
-import { logout as logoutFromBackend } from '../../services/authService'
-import { getBackendError } from '../../services/backendService'
 
 const links = [
   { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
@@ -34,15 +32,16 @@ export function AppLayout() {
   const navigate = useNavigate()
   const initials = (user?.name ?? 'Alex Morgan').split(' ').map((part) => part[0]).slice(0, 2).join('').toUpperCase()
   const closeMenu = () => setMobileOpen(false)
-  const logout = async () => {
-    let message: string | null = null
-    try {
-      await logoutFromBackend()
-    } catch (error) {
-      message = getBackendError(error, 'The backend could not confirm session revocation.')
-    }
+  useEffect(() => {
+    sideNavRef.current?.querySelector('.nav-link.active')?.scrollIntoView({
+      block: 'nearest',
+      behavior: 'smooth',
+    })
+  }, [pathname])
+
+  const logout = () => {
     setUser(null)
-    notify(message ? `Signed out locally; backend logout failed: ${message}` : 'You have been signed out.', message ? 'error' : 'info')
+    notify('You have been signed out.', 'info')
     navigate('/')
   }
 

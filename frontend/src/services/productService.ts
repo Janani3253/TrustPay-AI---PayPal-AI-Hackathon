@@ -1,8 +1,6 @@
 import { api } from './api'
 import type { Product, ProductApiListResponse, ProductApiProduct, ProductCategory } from '../types'
 
-export const DUMMYJSON_PLATFORM_ID = 'dummyjson'
-
 export function mapProduct(item: ProductApiProduct): Product {
   return {
     id: String(item.id),
@@ -26,42 +24,21 @@ export function mapProduct(item: ProductApiProduct): Product {
   }
 }
 
-export interface ProductListOptions {
-  query?: string
-  category?: string
-  limit?: number
-  skip?: number
-  platform?: string
-}
-
-export async function getProductList(options: ProductListOptions = {}): Promise<ProductApiListResponse> {
-  const { query, category, limit = 24, skip = 0, platform = DUMMYJSON_PLATFORM_ID } = options
-  const cleanQuery = query?.trim()
-  const path = cleanQuery && !category ? '/products/search' : '/products'
-  const response = await api.get<ProductApiListResponse>(path, {
-    params: {
-      ...(cleanQuery ? { q: cleanQuery } : {}),
-      ...(category ? { category } : {}),
-      limit,
-      skip,
-      platform,
-    },
+export async function getProducts(options: { query?: string; category?: string; limit?: number } = {}): Promise<Product[]> {
+  const { query, category, limit = 200 } = options
+  const response = await api.get<ProductApiListResponse>('/products', {
+    params: { ...(query?.trim() ? { q: query.trim() } : {}), ...(category ? { category } : {}), limit },
   })
-  return response.data
+  return response.data.products.map(mapProduct)
 }
 
-export async function getProducts(options: ProductListOptions = {}): Promise<Product[]> {
-  const response = await getProductList(options)
-  return response.products.map(mapProduct)
-}
-
-export async function getProduct(id: string, platform = DUMMYJSON_PLATFORM_ID): Promise<Product> {
-  const response = await api.get<ProductApiProduct>(`/products/${encodeURIComponent(id)}`, { params: { platform } })
+export async function getProduct(id: string): Promise<Product> {
+  const response = await api.get<ProductApiProduct>(`/products/${encodeURIComponent(id)}`)
   return mapProduct(response.data)
 }
 
-export async function getProductCategories(platform = DUMMYJSON_PLATFORM_ID): Promise<ProductCategory[]> {
-  const response = await api.get<ProductCategory[]>('/products/categories', { params: { platform } })
+export async function getProductCategories(): Promise<ProductCategory[]> {
+  const response = await api.get<ProductCategory[]>('/products/categories')
   return response.data
 }
 

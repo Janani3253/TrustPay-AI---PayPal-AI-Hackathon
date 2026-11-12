@@ -9,7 +9,6 @@ export function getOrderFingerprint(cart: CartItem[], intent: PurchaseIntent | n
       maximumBudget: intent.maximumBudget,
       currency: intent.currency,
       trustedSellersOnly: intent.trustedSellersOnly,
-      platformId: intent.platformId,
     } : null,
     cart: [...cart]
       .sort((left, right) => left.product.id.localeCompare(right.product.id))

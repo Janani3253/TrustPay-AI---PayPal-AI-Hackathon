@@ -56,18 +56,8 @@ export interface PurchaseRequirement {
   value: string
 }
 
-export interface ExtractedIntent {
-  category: string
-  brand: string[]
-  max_budget: number | null
-  currency: string
-  features: string[]
-  quantity: number
-}
-
 export interface PurchaseIntent {
   request: string
-  original_request?: string
   category: string
   requirements: PurchaseRequirement[]
   maximumBudget: number
@@ -75,53 +65,50 @@ export interface PurchaseIntent {
   trustedSellersOnly: boolean
   platformId?: string
   excludeAccessories?: boolean
-  intent?: ExtractedIntent
-  brand?: string[]
-  quantity?: number
-  features?: string[]
 }
 
 export interface RequirementMatch {
   name: string
   requested: string
-  status: 'Matched' | 'Not available for verification' | 'Not matched' | 'Not verified' | string
+  status: 'Matched' | 'Mentioned in catalogue (unverified)' | 'Not available for verification' | 'Not matched'
   explanation: string
-  verified?: boolean
 }
 
-export interface RecommendationScoreBreakdown {
-  category_match_score?: number
-  brand_match_score: number
-  price_suitability_score: number
-  feature_match_score: number
-  rating_score: number
-  total_score: number
-  normalized_score?: number
+export interface RecommendationConstraint {
+  name: string
+  status: 'Matched' | 'Not available for verification'
+  explanation: string
 }
 
 export interface ProductMatchAnalysis {
   percentage: number
-  normalized_score?: number
-  match_tier?: 'FULL MATCH' | 'PARTIAL MATCH' | 'NOT VERIFIED' | 'EXCLUDED' | string
+  matchType?: 'Exact Match' | 'Partial Match' | 'No Match'
+  rankingTier?: number
+  nameRelevance?: number
+  nameMatched?: boolean
+  requestedBrand?: string | null
+  brandMatched?: boolean | null
+  brandMatchStatus?: string
+  verificationStatus?: string
   categoryMatched: boolean
   specificationsMatched?: boolean | null
   budgetMatched: boolean | null
-  brandMatched?: boolean
   matches: RequirementMatch[]
-  status?: string
-  breakdown?: RecommendationScoreBreakdown
-  is_fully_matching?: boolean
-  recommendation_reason?: string
-  unverified_features?: string[]
-}
-
-export interface SecurityScanResult {
-  is_suspicious: boolean
-  risk_level: 'LOW' | 'MEDIUM' | 'HIGH'
-  detected_patterns: string[]
-  action: 'ALLOW' | 'FLAG_FOR_REVIEW' | 'BLOCK_AND_REVIEW'
-  explanation: string
-  findings?: Array<{ rule_id: string; category: string; severity: string; evidence: string; description: string }>
+  cataloguePrice?: number | null
+  catalogueCurrency?: Currency
+  convertedPrice?: number | null
+  convertedShipping?: number | null
+  convertedTax?: number | null
+  comparableTotal?: number | null
+  comparisonCurrency?: Currency
+  budgetCurrency?: Currency | null
+  budgetAmount?: number | null
+  exchangeRate?: number | null
+  exchangeRateBase?: Currency
+  exchangeRateQuote?: Currency
+  exchangeRateDate?: string | null
+  constraints?: RecommendationConstraint[]
+  status?: 'Matches Requirements' | 'Exact Match' | 'Partial Match' | 'No Match' | 'Budget Exceeded' | 'Specifications Unverified' | 'Constraint Verification Pending' | 'Exchange Rate Unavailable' | 'Category Mismatch'
 }
 
 export interface ProductRecommendation {
