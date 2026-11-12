@@ -33,19 +33,15 @@ async def parse_intent(
         )
 
     from app.core.config import settings
-    if not settings.is_gemini_configured:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Gemini AI is not configured. Please set GEMINI_API_KEY.",
-        )
 
     try:
         user_id = int(user["id"] if isinstance(user, dict) else user.id)
         intent = await intent_service.parse_shopping_intent(payload)
+        method_desc = "Gemini AI" if settings.is_gemini_configured else "rule-based"
         add_audit(
             user_id,
             "Purchase policy created",
-            "Created a purchase policy through the Gemini AI intent parser.",
+            f"Created a purchase policy through the {method_desc} intent parser.",
         )
         return intent
     except AIException as ai_err:
