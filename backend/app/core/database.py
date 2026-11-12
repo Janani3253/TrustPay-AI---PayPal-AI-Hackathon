@@ -25,8 +25,13 @@ def normalize_database_url(url: str | None) -> str | None:
     elif url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+psycopg://", 1)
 
-    # Render PostgreSQL requires SSL (sslmode=require) for external connections
-    if "sslmode=" not in url and ("render.com" in url or os.getenv("RENDER")):
+    # Render and Supabase PostgreSQL require SSL (sslmode=require) for external connections
+    if "sslmode=" not in url and (
+        "render.com" in url
+        or os.getenv("RENDER")
+        or "supabase.com" in url
+        or "supabase.co" in url
+    ):
         separator = "&" if "?" in url else "?"
         url = f"{url}{separator}sslmode=require"
 
